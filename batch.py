@@ -11,12 +11,12 @@ Can also be run manually at any time for immediate diagnosis.
 
 The 6 checks
 ─────────────
-  Q1  Stuck files        — PENDING/PROCESSING older than N hours
-  Q2  Checksum mismatch  — checksum_transferred != checksum_raw/compressed
-  Q3  Minutes divergence — |total_minutes_db - total_minutes_es| > threshold%
-  Q4  Missing records    — record_count_processed < record_count_expected
-  Q5  Files on disk not in DB — files present in backup tree but not registered
-  Q6  Daily summary      — per operator/type counts for the report
+  Q1  Stuck files        : PENDING/PROCESSING older than N hours
+  Q2  Checksum mismatch  : checksum_transferred != checksum_raw/compressed
+  Q3  Minutes divergence : |total_minutes_db - total_minutes_es| > threshold%
+  Q4  Missing records    : record_count_processed < record_count_expected
+  Q5  Files on disk not in DB : files present in backup tree but not registered
+  Q6  Daily summary      : per operator/type counts for the report
 
 Usage
 ─────
@@ -86,7 +86,7 @@ def log_anomaly(conn, file_id: Optional[str], anomaly_type: str,
 
 def check_stuck_files(conn, config: dict, dry_run: bool) -> list[dict]:
     """
-    Q1 — Files stuck in PENDING or PROCESSING for longer than
+    Q1 : Files stuck in PENDING or PROCESSING for longer than
     `stuck_file_hours` hours. These indicate a pipeline failure:
     either the Java processor never picked up the file, or it crashed
     without updating the status.
@@ -137,10 +137,10 @@ def check_stuck_files(conn, config: dict, dry_run: bool) -> list[dict]:
 
 def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
     """
-    Q2 — Files where checksum_transferred differs from the expected
+    Q2 : Files where checksum_transferred differs from the expected
     checksum (checksum_compressed if available, else checksum_raw).
     Any difference means the file was corrupted during FTP transfer.
-    Always CRITICAL — a corrupted file at the regulator is never acceptable.
+    Always CRITICAL : a corrupted file at the regulator is never acceptable.
     """
     results = []
 
@@ -189,12 +189,12 @@ def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
 
 def check_minutes_divergence(conn, config: dict, dry_run: bool) -> list[dict]:
     """
-    Q3 — Files where |total_minutes_db - total_minutes_es| / total_minutes_db
+    Q3 : Files where |total_minutes_db - total_minutes_es| / total_minutes_db
     exceeds the configured threshold percentage.
     This detects inconsistencies between what Java wrote to the DB and
     what got indexed in ElasticSearch.
 
-    Binary CDR types (msc, pgw, cnn) are excluded — they don't have minutes.
+    Binary CDR types (msc, pgw, cnn) are excluded : they don't have minutes.
     Severity:
       WARNING  → delta between threshold and 2× threshold
       CRITICAL → delta > 2× threshold
@@ -250,7 +250,7 @@ def check_minutes_divergence(conn, config: dict, dry_run: bool) -> list[dict]:
 
 def check_missing_records(conn, dry_run: bool) -> list[dict]:
     """
-    Q4 — Files where record_count_processed < record_count_expected.
+    Q4 : Files where record_count_processed < record_count_expected.
     Binary CDR types are excluded (their expected count is meaningless).
     Severity:
       WARNING  → missing < 1% of expected
@@ -306,7 +306,7 @@ def check_missing_records(conn, dry_run: bool) -> list[dict]:
 
 def check_files_missing_from_db(conn, config: dict, dry_run: bool) -> list[dict]:
     """
-    Q5 — Files present on disk in the backup tree but NOT registered in
+    Q5 : Files present on disk in the backup tree but NOT registered in
     the cdr_registry. This catches files the watcher missed (e.g. it was
     down when the file arrived, or the file extension is not watched).
 
@@ -369,8 +369,8 @@ def check_files_missing_from_db(conn, config: dict, dry_run: bool) -> list[dict]
 
 def get_daily_summary(conn) -> list[dict]:
     """
-    Q6 — Daily summary: count of files per operator/type/status for today.
-    Used in the report — not an anomaly check, just informational.
+    Q6 : Daily summary: count of files per operator/type/status for today.
+    Used in the report : not an anomaly check, just informational.
     """
     with conn.cursor() as cur:
         cur.execute("""
@@ -428,7 +428,7 @@ def build_report(results: dict, config: dict) -> str:
         lines.append(f"  ✗  {msg}")
 
     lines.append("=" * 70)
-    lines.append("  TRAFSCAN — Reconciliation Batch Report")
+    lines.append("  TRAFSCAN : Reconciliation Batch Report")
     lines.append(f"  Generated: {now}")
     lines.append("=" * 70)
 
@@ -524,11 +524,6 @@ def build_report(results: dict, config: dict) -> str:
             lines.append("")
             lines.append("  !! ACTION REQUIRED: Review CRITICAL anomalies above !!")
 
-    lines.append("")
-    lines.append("=" * 70)
-    return "\n".join(lines)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -539,7 +534,7 @@ def main():
     parser.add_argument("--report",  default=None,
                         help="Path to save the text report (optional)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Run checks and print report but do not write to anomaly_log")
+                        help="Run checks and print report but do not write to anomaly_log or send alerts")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -582,14 +577,15 @@ def main():
         conn.close()
 
     results = {
-        "stuck":          stuck,
-        "mismatches":     mismatches,
-        "divergences":    divergences,
+        "stuck":           stuck,
+        "mismatches":      mismatches,
+        "divergences":     divergences,
         "missing_records": missing_records,
-        "unregistered":   unregistered,
-        "summary":        summary,
+        "unregistered":    unregistered,
+        "summary":         summary,
     }
 
+    # ── Text report ───────────────────────────────────────────────────────────
     report = build_report(results, config)
     print(report)
 
@@ -597,13 +593,32 @@ def main():
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
         with open(args.report, "w", encoding="utf-8") as f:
             f.write(report)
-        log.info("[batch] Report saved to: %s", args.report)
+        log.info("[batch] Text report saved to: %s", args.report)
+
+    # ── HTML report + email + NOC notification ────────────────────────────────
+    from alerting import build_html_report, send_email_alert, build_noc_payload, send_noc_notification
+
+    html_report = build_html_report(results, config)
+
+    report_dir = config.get("batch", {}).get("report_dir", "reports")
+    date_str   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_path  = Path(report_dir) / f"report_{date_str}.html"
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_report)
+    log.info("[batch] HTML report saved to: %s", html_path)
+
+    if not args.dry_run:
+        send_email_alert(results, config, html_report)
+        noc_payload = build_noc_payload(results)
+        send_noc_notification(noc_payload, config)
+    else:
+        log.info("[batch] DRY-RUN: skipping email and NOC notification.")
 
     total = (len(stuck) + len(mismatches) + len(divergences) +
              len(missing_records) + len(unregistered))
     log.info("[batch] Done. %d anomaly(ies) detected.", total)
 
-    # Exit code 1 if any CRITICAL anomaly — useful for cron alerting
     critical = any(
         r.get("severity") == "CRITICAL"
         for r in (stuck + mismatches + divergences + missing_records + unregistered)

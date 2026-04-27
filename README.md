@@ -458,3 +458,4 @@ This is already included in all SQL templates above.
 | `verify_ftp.py` | FTP transfer integrity verifier |
 | `config.yaml` | All configuration (DB, watched folders, thresholds) |
 | `01_schema.sql` | PostgreSQL schema - run once to initialize the database |
+ 
