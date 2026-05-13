@@ -1,8 +1,8 @@
 # TRAFSCAN VERIFICATION - Solution A: CDR Registry
 
-## Integration Guide for the Trafscan Team
+## Integration Guide for Trafscan
 
-Version 3.0 - May 2025
+**Version 3.1 - May 2026**
 
 ---
 
@@ -13,14 +13,70 @@ arrives on the frontale is automatically tracked from the moment it lands on
 disk until it is processed by Java and indexed in ElasticSearch.
 
 The registry answers these questions in real time with a single SQL query:
-
 - Did all CDR files arrive and get processed?
 - Did Java and ElasticSearch produce the same values (minutes, voice, SMS, data, recharge)?
 - Was any file corrupted during FTP transfer?
 - Are there any records lost between reception and processing?
+- Is processing taking abnormally long compared to recent history?
+- Are forfait counts collapsing unexpectedly?
 
-It runs alongside your existing Trafscan system. It does not modify any
-existing code - it only adds SQL calls at key points in the Java pipeline.
+It runs alongside the existing Trafscan system. It does not modify any
+existing code — it only **adds** SQL calls at key points in the Java pipeline.
+
+---
+
+## Getting started
+
+```cmd
+# 1. Clone the repo
+git clone https://github.com/RanimDamak/trafscan-verification.git
+cd trafscan-verification
+
+# 2. Install dependencies
+pip install psycopg2-binary pyyaml watchdog
+
+# 3. Create your local config from the template
+copy config.example.yaml config.yaml   # Windows
+# cp config.example.yaml config.yaml   # Linux/Mac
+
+# 4. Fill in config.yaml: database credentials, SMTP, watcher paths
+#    (config.yaml is gitignored — never committed)
+
+# 5. Apply the schema to the Trafscan PostgreSQL database
+#    (must be the same DB as the Trafscan application)
+psql -h localhost -p 5432 -U trafscan_verify -d trafscan -f 01_schema.sql
+
+# 6. Test the HTML report template (no DB needed)
+python alerting.py --config config.yaml --test
+
+# 7. Run the batch in dry-run mode (checks only, no DB writes, no email)
+python batch.py --dry-run
+
+# 8. Start the file watcher (runs continuously)
+python -m trafscan --config config.yaml
+```
+
+---
+
+
+## Critical: Database placement
+
+> **The CDR Registry tables must be in the SAME PostgreSQL database as the
+> existing Trafscan application.**
+
+**Why:** The tables `daily_state_forfait` and `daily_state_unknown_forfait`
+(used by check Q7) already exist in the Trafscan DB. If the registry were in a
+separate DB, Q7 would need a second connection and a cross-DB query, which
+PostgreSQL does not support natively. The Java hooks also benefit from reusing
+the existing JDBC connection pool — no new datasource to configure.
+
+**In practice:** same `host`, same `dbname` in `config.yaml`. Use a dedicated
+PostgreSQL user `trafscan_verify` with INSERT/UPDATE/SELECT on `cdr_registry`,
+`anomaly_log`, `operators`, and SELECT on `daily_state_forfait`,
+`daily_state_unknown_forfait`.
+
+> **Note:** An earlier version of this README said "The registry DB is separate
+> from the main Trafscan application DB." That was incorrect and has been fixed.
 
 ---
 
@@ -43,27 +99,29 @@ Layer 1: File Watcher + Hasher (Python)
     - Inserts row into cdr_registry with status PENDING
     │
     ▼
-Layer 2: CDR Registry (PostgreSQL)
-    - Table: cdr_registry   ← source of truth for every file
-    - Table: anomaly_log    ← all detected anomalies
-    - Table: operators      ← operator reference
+Layer 2: CDR Registry (PostgreSQL — same DB as Trafscan app)
+    - Table: cdr_registry    ← source of truth for every file
+    - Table: anomaly_log     ← all detected anomalies
+    - Table: operators       ← operator reference
+    - Tables used by Q7 (already in Trafscan DB, no new tables needed):
+        daily_state_forfait, daily_state_unknown_forfait
     │
     ▼
 Layer 2 (Java side): Instrumented Java hooks
-    - Java updates status to PROCESSING at start           (Hook 1)
-    - Java updates status to DONE + all traffic values     (Hook 2)
-    - Java updates status to ERROR on exception            (Hook 3)
-    - Java updates ES values after ES indexing             (Hook 4)
+    - Hook 1: update status to PROCESSING at start
+    - Hook 2: update status to DONE + all traffic values at end
+    - Hook 3: update status to ERROR on exception
+    - Hook 4: store ES values after ElasticSearch indexing
     │
     ▼
 Layer 3: Reconciliation Batch (Python, runs at 02:00)
-    - 8 checks against the registry (Q1, Q2, Q3a–e, Q4, Q5a, Q5b, Q5c, Q6)
+    - 13 checks (Q1, Q2, Q3a–e, Q4, Q5a, Q5b, Q5c, Q6, Q_PT, Q7)
     - Writes to anomaly_log
     - Generates HTML report + NOC JSON payload
     │
     ▼
 Layer 4: Alerting + Reporting
-    - Email alert (SMTP - requires configuration, see below)
+    - Email alert (SMTP — requires configuration, see below)
     - HTML daily report saved to reports/
     - noc_latest.json for frontend / NOC panel integration
 ```
@@ -78,9 +136,9 @@ to be detected automatically:
 ```
 /opt/backup/
     orange/
-        in/       ← IN CDRs (recharge, voucher - text format)
-        msc/      ← MSC CDRs (voice - binary Ericsson format)
-        pgw/      ← PGW/GGSN CDRs (data - binary IPDR format)
+        in/       ← IN CDRs (recharge, voucher — text format)
+        msc/      ← MSC CDRs (voice — binary Ericsson format)
+        pgw/      ← PGW/GGSN CDRs (data — binary IPDR format)
         cnn/      ← CNN/CCN CDRs (binary ASN.1/BER format)
         sdp/      ← SDP CDRs (ASN, ADJ formats)
         air/      ← AIR CDRs (text format)
@@ -100,19 +158,41 @@ the filename. This is the authoritative source.
 
 ---
 
+## All checks (v3.1)
+
+| Check | What it detects | Severity |
+|-------|-----------------|----------|
+| **Q1** | Files stuck PENDING/PROCESSING > 2h | WARNING / CRITICAL |
+| **Q2** | File corruption during FTP transfer (checksum mismatch) | CRITICAL |
+| **Q3a** | `total_minutes_db` vs `total_minutes_es` > threshold% | WARNING / CRITICAL |
+| **Q3b** | `voice_db` vs `voice_es` > threshold% | WARNING / CRITICAL |
+| **Q3c** | `sms_db` vs `sms_es` > threshold% | WARNING / CRITICAL |
+| **Q3d** | `data_db` vs `data_es` > threshold% | WARNING / CRITICAL |
+| **Q3e** | `recharge_db` vs `recharge_es` > threshold% | WARNING / CRITICAL |
+| **Q4** | Java processed fewer records than expected | WARNING / CRITICAL |
+| **Q5a** | Files received today vs configured baseline ± tolerance | WARNING / CRITICAL |
+| **Q5b** | Pipeline funnel: files stuck PENDING or not completing | WARNING / CRITICAL |
+| **Q5c** | Files on disk but absent from DB (watcher missed them) | CRITICAL |
+| **Q6** | Daily summary per operator/type (informational) | INFO |
+| **Q_PT** | Processing duration > N× 7-day rolling median per cdr_type | WARNING / CRITICAL |
+| **Q7** | Daily forfait count vs 7-day median (daily_state_forfait + daily_state_unknown_forfait) | WARNING / CRITICAL |
+
+---
+
 ## Database schema
 
 ### cdr_registry (main table)
 
 | Column | Type | Description |
-|---|---|---|
+|--------|------|-------------|
 | file_id | UUID | Primary key, auto-generated |
-| file_name | VARCHAR(255) | Original filename, UNIQUE |
+| file_name | VARCHAR(255) | Original filename, UNIQUE (basename only) |
 | operator_id | VARCHAR(50) | Operator: orange / atel / moov |
 | cdr_type | ENUM | in / msc / pgw / cnn / sdp / air / occ |
 | received_at | TIMESTAMP | When file was detected by the watcher |
 | processing_started_at | TIMESTAMP | Set by Java Hook 1 (requires hook integration) |
 | processing_ended_at | TIMESTAMP | Set by Java Hook 2/3 (requires hook integration) |
+| updated_at | TIMESTAMP | Auto-updated on every row change (trigger-managed) |
 | checksum_raw | CHAR(64) | SHA-256 of the original file on disk |
 | checksum_compressed | CHAR(64) | SHA-256 after gzip compression (if applicable) |
 | checksum_transferred | CHAR(64) | SHA-256 verified at regulator after FTP |
@@ -126,21 +206,17 @@ the filename. This is the authoritative source.
 | sms_es | DECIMAL(18,3) | SMS traffic balance from ElasticSearch (Hook 4) |
 | data_db | DECIMAL(18,3) | Data traffic balance from Java → DB (Hook 2) |
 | data_es | DECIMAL(18,3) | Data traffic balance from ElasticSearch (Hook 4) |
-| recharge_db | DECIMAL(18,3) | Recharge balance from Java → DB (Hook 2) - in CDRs only |
+| recharge_db | DECIMAL(18,3) | Recharge balance from Java → DB (Hook 2) — in CDRs only |
 | recharge_es | DECIMAL(18,3) | Recharge balance from ElasticSearch (Hook 4) |
 | processing_status | ENUM | PENDING / PROCESSING / DONE / ERROR / MISMATCH |
+| archive_path | VARCHAR(512) | Path to warm/cold archive (NULL if not archived yet) |
 | notes | TEXT | Error messages, flags, free-form notes |
 
-> **Source mapping (Trafscan DB → registry columns)**
-> - `voice_db` ← `AbonneTable.voice_counted_balance` aggregated per file
-> - `sms_db` ← `AbonneTable.sms_counted_balance` aggregated per file
-> - `data_db` ← `AbonneTable.data_counted_balance` aggregated per file
-> - `recharge_db` ← `AbonneTable.recharge_balance` aggregated per file
->
-> **Forfaits (pending):** Forfait data is stored in two separate tables
-> (known / unknown forfaits). Reconciliation for forfaits will be added
-> once the team confirms the exact table names and comparable ES fields.
-> It will be implemented as a dedicated query rather than per-file columns.
+**Source mapping (Trafscan DB → registry columns):**
+- `voice_db` ← `AbonneTable.voice_counted_balance` aggregated per file
+- `sms_db` ← `AbonneTable.sms_counted_balance` aggregated per file
+- `data_db` ← `AbonneTable.data_counted_balance` aggregated per file
+- `recharge_db` ← `AbonneTable.recharge_balance` aggregated per file
 
 ### processing_status lifecycle
 
@@ -169,20 +245,17 @@ You need to add **4 SQL calls** to the existing CDR processing code.
 These are standard JDBC PreparedStatement calls against the Trafscan
 PostgreSQL database.
 
-You need one connection (or connection pool) to the registry DB
-in addition to your existing connections.
+Use the **same connection pool** as the existing Trafscan application —
+same host, same dbname. No new datasource is needed.
 
 ### JDBC connection
 
 ```java
-// Add to your configuration / dependency injection
-String registryUrl = "jdbc:postgresql://localhost:5432/trafscan";
-Connection registryConn = DriverManager.getConnection(
-    registryUrl, "trafscan_user", "your_password"
-);
+// Reuse your existing Trafscan DB connection pool — same host, same dbname.
+Connection trafscanConn = /* your existing pool */ ;
 ```
 
-### Hook 1 - Before processing starts
+### Hook 1 — Before processing starts
 
 Call immediately before your CDR parsing loop begins.
 `fileName` is the basename of the file (e.g. `CDR_20250401_atel.gz`).
@@ -196,20 +269,21 @@ String sqlStart = """
     WHERE file_name = ?
 """;
 
-try (PreparedStatement ps = registryConn.prepareStatement(sqlStart)) {
+try (PreparedStatement ps = trafscanConn.prepareStatement(sqlStart)) {
     ps.setString(1, fileName);
     int updated = ps.executeUpdate();
-    registryConn.commit();
+    trafscanConn.commit();
     if (updated == 0) {
         logger.warn("TRAFSCAN: file not in registry: " + fileName);
+        // Do NOT block processing — log and continue
     }
 }
 ```
 
-### Hook 2 - After processing succeeds
+### Hook 2 — After processing succeeds
 
-Call after your CDR parsing loop completes successfully.
-Include all traffic aggregates computed during parsing.
+Call after your CDR parsing loop completes successfully. Include all
+traffic aggregates computed during parsing.
 
 ```java
 String sqlDone = """
@@ -230,24 +304,25 @@ String sqlDone = """
     WHERE file_name = ?
 """;
 
-try (PreparedStatement ps = registryConn.prepareStatement(sqlDone)) {
-    ps.setLong(1, recordCount);       // for CASE comparison
-    ps.setLong(2, recordCount);       // record_count_processed
-    ps.setDouble(3, totalMinutesDb);  // AbonneTable.voice_counted_balance aggregate
-    ps.setDouble(4, voiceBalance);    // AbonneTable.voice_counted_balance aggregate
-    ps.setDouble(5, smsBalance);      // AbonneTable.sms_counted_balance aggregate
-    ps.setDouble(6, dataBalance);     // AbonneTable.data_counted_balance aggregate
-    ps.setDouble(7, rechargeBalance); // AbonneTable.recharge_balance aggregate (in CDRs)
+try (PreparedStatement ps = trafscanConn.prepareStatement(sqlDone)) {
+    ps.setLong(1,   recordCount);       // for CASE comparison
+    ps.setLong(2,   recordCount);       // record_count_processed
+    ps.setDouble(3, totalMinutesDb);
+    ps.setDouble(4, voiceBalance);      // AbonneTable.voice_counted_balance aggregate
+    ps.setDouble(5, smsBalance);        // AbonneTable.sms_counted_balance aggregate
+    ps.setDouble(6, dataBalance);       // AbonneTable.data_counted_balance aggregate
+    ps.setDouble(7, rechargeBalance);   // AbonneTable.recharge_balance aggregate (in CDRs)
     ps.setString(8, fileName);
     ps.executeUpdate();
-    registryConn.commit();
+    trafscanConn.commit();
 }
 ```
 
-> **Note:** For CDR types where a value is not applicable (e.g. recharge for
-> MSC voice files), pass `null` (`ps.setNull(7, Types.DECIMAL)`).
+> **Note:** For CDR types where a value is not applicable (e.g. `recharge_db`
+> for MSC voice files, or `data_db` for IN recharge files), pass `null`:
+> `ps.setNull(7, Types.DECIMAL)`. All batch checks handle NULL gracefully.
 
-### Hook 3 - In the catch block (Java error)
+### Hook 3 — In the catch block (Java error)
 
 Call inside your existing catch block.
 
@@ -260,21 +335,21 @@ String sqlError = """
     WHERE file_name = ?
 """;
 
-try (PreparedStatement ps = registryConn.prepareStatement(sqlError)) {
+try (PreparedStatement ps = trafscanConn.prepareStatement(sqlError)) {
     ps.setString(1, "Java error: " + exception.getMessage());
     ps.setString(2, fileName);
     ps.executeUpdate();
-    registryConn.commit();
+    trafscanConn.commit();
 } catch (SQLException sqlEx) {
     logger.error("TRAFSCAN: failed to update error status: " + sqlEx.getMessage());
     // Never let registry updates block your main error handling
 }
 ```
 
-### Hook 4 - After ElasticSearch indexing
+### Hook 4 — After ElasticSearch indexing
 
 Call after indexing the file's data in ES. Pass the same traffic values
-as reported by ES for the divergence check to be meaningful.
+as reported by ES so the divergence check is meaningful.
 
 ```java
 String sqlEs = """
@@ -288,7 +363,7 @@ String sqlEs = """
     WHERE file_name = ?
 """;
 
-try (PreparedStatement ps = registryConn.prepareStatement(sqlEs)) {
+try (PreparedStatement ps = trafscanConn.prepareStatement(sqlEs)) {
     ps.setDouble(1, totalMinutesEs);
     ps.setDouble(2, voiceEs);
     ps.setDouble(3, smsEs);
@@ -296,7 +371,7 @@ try (PreparedStatement ps = registryConn.prepareStatement(sqlEs)) {
     ps.setDouble(5, rechargeEs);
     ps.setString(6, fileName);
     ps.executeUpdate();
-    registryConn.commit();
+    trafscanConn.commit();
 }
 ```
 
@@ -306,14 +381,14 @@ try (PreparedStatement ps = registryConn.prepareStatement(sqlEs)) {
 YourCDRProcessor.process(file):
     fileName = file.getName()              ← basename only
 
-    [Hook 1] → status = PROCESSING
+    [Hook 1] → status = PROCESSING, processing_started_at
 
     try:
-        recordCount    = 0
-        totalMinutes   = 0.0
-        voiceBalance   = 0.0
-        smsBalance     = 0.0
-        dataBalance    = 0.0
+        recordCount     = 0
+        totalMinutes    = 0.0
+        voiceBalance    = 0.0
+        smsBalance      = 0.0
+        dataBalance     = 0.0
         rechargeBalance = 0.0
 
         for each record in file:
@@ -340,113 +415,112 @@ YourCDRProcessor.process(file):
 
 ---
 
-## Note on processing time detection
-
-Processing time (`processing_started_at` / `processing_ended_at`) will be
-available in the registry **once Hook 1 and Hook 2/3 are integrated** by
-the Java team. The team lead confirmed this requires enriching the Java
-decoder - it is not yet implemented.
-
-Once the timestamps are populated, they can be used to detect files with
-suspiciously long processing times (potential silent corruption, infinite
-loops, or resource saturation). The batch will be extended with this check
-at that point.
-
----
-
-## Note on forfait reconciliation
-
-Forfait data is stored in two separate tables in the Trafscan DB (known
-and unknown forfaits) and is **not a per-file aggregate**. A dedicated
-reconciliation query will be added to the batch once the team confirms:
-
-1. The exact names of the two forfait tables
-2. Which fields are comparable to what ElasticSearch indexes
-
-This will be implemented as a standalone check rather than columns in
-`cdr_registry`, since forfait data spans multiple files and operators.
-
----
-
-## Batch reconciliation checks (Q5a, Q5b, Q5c)
-
-The old single "Q5 - files on disk not in DB" check has been replaced by
-three complementary completeness checks that together give a full picture
-of file flow at every step of the pipeline.
-
-### Q5a - Daily file count vs baseline
+## Q5a — Daily file count vs baseline
 
 For each operator × CDR type, compares today's received file count against
 a configured expected baseline. This detects days where significantly fewer
-(or more) files arrived than normal - which the watcher alone cannot catch
+(or more) files arrived than normal — something the watcher alone cannot catch
 because it only reacts to files that actually land.
 
 **Severity:**
-- WARNING → count outside baseline ± `tolerance_pct` (default 3%)
-- CRITICAL → count outside baseline ± 2× `tolerance_pct`, or zero files received
+- WARNING → count outside baseline ± `baseline_tolerance_pct` (default 20%)
+- CRITICAL → count outside 2× `baseline_tolerance_pct`, or zero files received when baseline > 0
 
-**Configuration - baselines section in `config.yaml`:**
+**Configuration in `config.yaml`:**
 
 ```yaml
-baselines:
-  tolerance_pct: 3.0          # ±3% is normal daily variation
-  operator_type:
-    orange:
-      in:   120               # ← approximate files/day for orange/in
-      msc:  80                # ← fill in once team provides counts
-      pgw:  null              # ← null = skip this combination, no alert
-    atel:
-      in:   90
-      msc:  null
-    moov:
-      in:   50
-      msc:  null
+batch:
+  file_count_baseline:
+    orange/in:  4        # ← approximate files/day — fill in once team provides counts
+    orange/msc: 24
+    orange/pgw: 0        # ← 0 = disabled for this combination (no alert)
+    atel/in:    4
+    atel/msc:   24
+    moov/in:    4
+    moov/msc:   24
+  baseline_tolerance_pct: 20
 ```
 
-Leave any value as `null` until the team provides the approximate daily
-count for that combination. The batch will skip it with an INFO log -
-no false alerts during the learning phase.
+Leave any value as `0` until the team provides the approximate daily count
+for that combination. The batch will skip it — no false alerts during the
+initial learning phase.
 
-### Q5b - Pipeline funnel check
+---
+
+## Q5b — Pipeline funnel check
 
 For each operator × CDR type, verifies that files flow correctly through
 every processing step today:
 
 ```
 received (any status)
-    └─► touched by Java (PROCESSING / DONE / ERROR / MISMATCH)
+    └─► touched by Java (not PENDING)
             └─► completed (DONE / ERROR / MISMATCH)
 ```
 
 Detects three types of gaps:
 - Files stuck **PENDING** past the grace period → Java never picked them up
-- Files stuck **PROCESSING** past the grace period → Java started but crashed
-- **Unexplained gap** between received and completed → something else failed
+- Files stuck **PROCESSING** past the grace period → Java started but crashed or hung
+- **Unexplained gap** between received and completed → something else failed silently
 
 Uses the same `batch.stuck_file_hours` grace period as Q1 to avoid alerting
-on files still legitimately in progress.
-
-### Q5c - Files on disk not registered in DB
-
-The original check: scans the backup directories and alerts on any file
-present on disk that has no corresponding row in `cdr_registry`. Catches
-files the watcher missed entirely (was down when file arrived, extension
-mismatch, etc.).
+on files still legitimately in progress at batch time (02:00).
 
 ---
 
+## Q_PT — Processing time check
 
-After transferring the compressed CDR file to the regulator, run:
+**Activates** once ≥ 10 DONE files exist per `cdr_type` in the 7-day window
+(configurable via `min_samples`). Until that threshold is reached it skips
+silently — no false alerts during initial rollout.
 
-```bash
-python verify_ftp.py \
-    --file CDR_20250401_atel.gz \
-    --local /path/to/received/file.gz
+**Fallback mode** (default, `use_java_timestamps: false`):
+Uses `updated_at - received_at`. This includes queue wait time but is
+immediately useful as a general indicator, and the team lead confirmed
+it is an acceptable `repère`.
+
+**Precise mode** (`use_java_timestamps: true`):
+Uses `processing_ended_at - processing_started_at`. Switch this on in
+`config.yaml` once Java Hooks 1+2 are confirmed live and populating those columns.
+
+Thresholds (configurable in `config.yaml`):
+- **WARNING**: duration > 3× 7-day median per cdr_type
+- **CRITICAL**: duration > 5× 7-day median per cdr_type
+
+---
+
+## Q7 — Forfait daily count
+
+Q7 checks that the daily total of forfait records does not collapse
+unexpectedly. It uses two tables already in the Trafscan DB — no new
+tables are needed:
+
+```sql
+-- Known forfaits (linked to a reference catalogue)
+daily_state_forfait         (id, date, count, id_forfait)
+
+-- Unknown forfaits (no matching catalogue entry)
+daily_state_unknown_forfait (id, forfait VARCHAR, date, count)
 ```
 
-This computes the SHA-256 of the file at the regulator and compares it to
-the checksum stored in the registry. If they differ → status set to MISMATCH
-and anomaly logged.
+**Total DB forfaits for a given date:**
+```sql
+SELECT
+    COALESCE((SELECT SUM(count) FROM daily_state_forfait         WHERE date = $1), 0)
+  + COALESCE((SELECT SUM(count) FROM daily_state_unknown_forfait WHERE date = $1), 0)
+  AS total_db_forfaits;
+```
+
+**Thresholds:** configurable via `batch.forfait.drop_warning_pct` (default 30%)
+and `drop_critical_pct` (default 70%). Zero when 7-day median > 0 → always CRITICAL.
+
+**Part 2 — ES comparison (PENDING):**
+> **TODO for Baha:** Does the ElasticSearch index expose a count of CDR records
+> with `cdrType = 'forfait'` (or an equivalent field) per date?
+> If yes, set `es_enabled: true` in `config.yaml` and fill in `es_index`,
+> `es_field`, `es_value`. The Part 2 placeholder in `batch.py` will then
+> be completed with one query. Until confirmed, only Part 1 (DB internal
+> consistency) runs.
 
 ---
 
@@ -455,7 +529,8 @@ and anomaly logged.
 ### Start the file watcher (runs continuously)
 
 ```bash
-python -m trafscan --config config.yaml
+# On the frontale server
+python -m trafscan --config /opt/trafscan/config.yaml
 ```
 
 Systemd service for production:
@@ -478,20 +553,29 @@ WantedBy=multi-user.target
 ### Run the nightly batch (02:00 every night)
 
 ```bash
-# Add to crontab
+# Linux — add to crontab
 0 2 * * * cd /opt/trafscan && python batch.py --report /var/trafscan/reports/$(date +\%Y\%m\%d).txt
 ```
 
 Windows Task Scheduler:
 - Program: `python`
 - Arguments: `batch.py --config config.yaml --report reports\batch.txt`
+- Start in: `C:\path\to\trafscan`
 - Trigger: Daily at 02:00
 
 ### Run batch manually (for immediate diagnosis)
 
 ```bash
 python batch.py --dry-run           # checks only, no DB writes, no email
-python batch.py --report report.txt # checks + save report
+python batch.py --report report.txt # full run, save text report
+```
+
+### Test the HTML report template
+
+```bash
+python alerting.py --config config.yaml --test
+# Generates test_report_v31.html with fake anomaly data
+# Does NOT send email — safe to run anytime to verify the template
 ```
 
 ---
@@ -514,85 +598,109 @@ alerting:
     - noc@example.com
   alert_on: [CRITICAL, WARNING]         # or [CRITICAL] only
 
-  # Optional: webhook for NOC frontend (see section below)
-  noc_webhook_url: ""                   # ← leave empty to disable
+  # Optional: POST JSON payload to NOC frontend after each batch run
+  noc_webhook_url: ""                   # ← leave empty to use file polling instead
 ```
 
-To test the email configuration without running a full batch:
+To verify SMTP settings before the first real batch run:
 
 ```bash
 python alerting.py --config config.yaml --test
 ```
 
-This sends a test email with fake data so you can verify SMTP settings
-before the first real batch run.
+This sends a test email with fake anomaly data so you can confirm the
+email arrives correctly without waiting for the nightly batch.
 
 ---
 
-## NOC / Frontend alerting integration
+## NOC / Frontend integration
 
 After every batch run, two files are written to `reports/`:
 
 | File | Description |
-|---|---|
-| `reports/report_YYYYMMDD_HHMMSS.html` | Full HTML report - open in any browser or NOC panel |
-| `reports/noc_latest.json` | JSON payload - always reflects the most recent batch run |
+|------|-------------|
+| `reports/report_YYYYMMDD_HHMMSS.html` | Full HTML report — open in any browser or NOC panel |
+| `reports/noc_latest.json` | JSON payload — always reflects the most recent batch run |
 
-### Option A - Polling (no server required)
+### Option A — Polling (no server required)
 
-The frontend periodically fetches `noc_latest.json`:
+The frontend periodically fetches `noc_latest.json`. Suggested poll interval: 5–15 minutes.
 
-```
-GET /reports/noc_latest.json
-```
+### Option B — Webhook (real-time push)
 
-Suggested poll interval: every 5–15 minutes.
+Set `alerting.noc_webhook_url` in `config.yaml`. The batch POSTs the full
+payload to that URL immediately after each run.
 
-### Option B - Webhook (real-time push)
+### Payload structure (v3.1)
 
-Set `alerting.noc_webhook_url` in `config.yaml`. The batch will POST
-the payload to that URL immediately after each run:
-
-```
-POST /api/noc/alerts
-Content-Type: application/json
-
+```json
 {
-  "generated_at": "2025-04-23T02:00:00",
-  "status": "CRITICAL",
+  "generated_at": "2025-05-01T02:00:00",
+  "version":      "3.1",
+  "status":       "CRITICAL",
   "summary": {
     "total_anomalies": 3,
-    "critical": 2,
-    "warnings": 1,
+    "critical":        2,
+    "warnings":        1,
     "files_done_today": 247
   },
   "anomalies": [
     {
       "type":        "MINUTES_DIVERGENCE",
       "severity":    "CRITICAL",
-      "file_name":   "CDR_20250423.gz",
+      "file_name":   "CDR_20250501.gz",
       "operator_id": "atel",
       "cdr_type":    "in",
-      "dimension":   "minutes",
       "detail":      "db=1000.25 es=1050.10 delta=4.97%"
     },
     {
       "type":        "VOICE_DIVERGENCE",
       "severity":    "WARNING",
-      "file_name":   "CDR_20250423.gz",
+      "file_name":   "CDR_20250501.gz",
       "operator_id": "atel",
       "cdr_type":    "in",
-      "dimension":   "voice",
       "detail":      "db=500.10 es=503.20 delta=0.62%"
+    },
+    {
+      "type":        "PROCESSING_TIME_ANOMALY",
+      "severity":    "WARNING",
+      "file_name":   "CDR_20250501_pgw.gz",
+      "operator_id": "orange",
+      "cdr_type":    "pgw",
+      "detail":      "Duration 45.0min = 3.2× median (14.1min over 32 samples, 7d)"
     }
-  ]
+  ],
+  "forfait": {
+    "today_known":   72000,
+    "today_unknown": 4500,
+    "today_total":   76500,
+    "median_total":  85000,
+    "drop_pct":      10.0,
+    "es_total":      null
+  }
 }
 ```
 
-The `status` field gives the frontend the overall color to show:
+The `status` field drives the NOC panel color:
 - `"OK"` → green
 - `"WARNING"` → orange
 - `"CRITICAL"` → red
+
+---
+
+## FTP transfer verification
+
+After transferring the compressed CDR file to the regulator, run:
+
+```bash
+python verify_ftp.py \
+    --file CDR_20250401_atel.gz \
+    --local /path/to/received/file.gz
+```
+
+This computes the SHA-256 of the file at the regulator and compares it to
+the checksum stored in the registry. If they differ → status set to MISMATCH
+and anomaly logged.
 
 ---
 
@@ -609,34 +717,41 @@ WHERE processing_status IN ('PENDING', 'PROCESSING')
 ORDER BY received_at ASC;
 ```
 
-### All anomalies from today
+### All anomalies from today (any severity)
 
 ```sql
-SELECT file_name, operator_id, cdr_type,
-       processing_status, record_count_expected, record_count_processed,
-       total_minutes_db, total_minutes_es, notes
-FROM cdr_registry
-WHERE processing_status IN ('ERROR', 'MISMATCH')
-  AND received_at >= CURRENT_DATE
-ORDER BY received_at DESC;
+SELECT al.anomaly_type, al.severity, al.detected_at,
+       cr.file_name, cr.operator_id, cr.cdr_type,
+       al.delta_value, al.threshold_value
+FROM anomaly_log al
+LEFT JOIN cdr_registry cr ON al.file_id = cr.file_id
+WHERE al.detected_at >= CURRENT_DATE
+  AND al.resolved = FALSE
+ORDER BY al.severity DESC, al.detected_at DESC;
 ```
 
-### Minutes divergence DB vs ES
+### All DB vs ES divergences (any dimension, today)
 
 ```sql
 SELECT file_name, operator_id,
        total_minutes_db, total_minutes_es,
-       ROUND(ABS(total_minutes_db - total_minutes_es)
-             / NULLIF(total_minutes_db, 0) * 100, 2) AS delta_pct
+       voice_db, voice_es,
+       sms_db,   sms_es,
+       data_db,  data_es,
+       recharge_db, recharge_es
 FROM cdr_registry
 WHERE processing_status = 'DONE'
-  AND total_minutes_db IS NOT NULL AND total_minutes_es IS NOT NULL
-  AND ABS(total_minutes_db - total_minutes_es)
-      / NULLIF(total_minutes_db, 0) * 100 > 1.0
-ORDER BY delta_pct DESC;
+  AND received_at >= CURRENT_DATE
+  AND (
+      ABS(total_minutes_db - total_minutes_es) / NULLIF(total_minutes_db, 0) > 0.005
+      OR ABS(voice_db    - voice_es)    / NULLIF(voice_db, 0)    > 0.005
+      OR ABS(sms_db      - sms_es)      / NULLIF(sms_db, 0)      > 0.005
+      OR ABS(data_db     - data_es)     / NULLIF(data_db, 0)     > 0.005
+      OR ABS(recharge_db - recharge_es) / NULLIF(recharge_db, 0) > 0.005
+  );
 ```
 
-### Voice/SMS/Data divergence DB vs ES
+### Voice/SMS/Data divergence (single dimension)
 
 ```sql
 -- Replace voice_db/voice_es with sms_db/sms_es or data_db/data_es as needed
@@ -665,87 +780,130 @@ GROUP BY operator_id, cdr_type
 ORDER BY operator_id, cdr_type;
 ```
 
-### Pipeline funnel - received vs completed today
+### Pipeline funnel — received vs completed today
 
 ```sql
 SELECT
     operator_id,
     cdr_type::text,
-    COUNT(*)                                                      AS received,
-    SUM(CASE WHEN processing_status != 'PENDING' THEN 1 ELSE 0 END) AS touched_by_java,
+    COUNT(*)                                                             AS received,
+    SUM(CASE WHEN processing_status != 'PENDING' THEN 1 ELSE 0 END)     AS touched_by_java,
     SUM(CASE WHEN processing_status IN ('DONE','ERROR','MISMATCH')
-             THEN 1 ELSE 0 END)                                   AS completed,
+             THEN 1 ELSE 0 END)                                          AS completed,
     SUM(CASE WHEN processing_status = 'PENDING'
              AND received_at < NOW() - INTERVAL '2 hours'
-             THEN 1 ELSE 0 END)                                   AS stuck_pending,
+             THEN 1 ELSE 0 END)                                          AS stuck_pending,
     SUM(CASE WHEN processing_status = 'PROCESSING'
              AND received_at < NOW() - INTERVAL '2 hours'
-             THEN 1 ELSE 0 END)                                   AS stuck_processing
+             THEN 1 ELSE 0 END)                                          AS stuck_processing
 FROM cdr_registry
 WHERE received_at >= CURRENT_DATE
 GROUP BY operator_id, cdr_type
 ORDER BY operator_id, cdr_type;
 ```
 
----
+### Today's forfait totals
 
-## Important notes for integration
+```sql
+SELECT
+    CURRENT_DATE AS date,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_forfait         WHERE date = CURRENT_DATE) AS known,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_unknown_forfait WHERE date = CURRENT_DATE) AS unknown,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_forfait         WHERE date = CURRENT_DATE)
+  + (SELECT COALESCE(SUM(count),0) FROM daily_state_unknown_forfait WHERE date = CURRENT_DATE) AS total;
+```
 
-**Binary CDR types (msc, pgw, cnn):**
-`record_count_expected` holds the raw newline count of the binary file,
-which is not meaningful for comparison. The batch automatically excludes
-these types from record count and minutes divergence checks. They are
-flagged with `notes = 'Binary CDR: ...'`.
+### Processing time outliers (7-day perspective)
 
-**File naming:**
-`file_name` in the registry is always the basename only (e.g. `CDR_20250401.gz`),
-never the full path. Your Java hooks must use the same basename.
-
-**Database connection:**
-The registry DB is separate from the main Trafscan application DB.
-Use a dedicated connection or pool. Credentials are in `config.yaml`.
-
-**Never block on registry failures:**
-The registry is a monitoring layer. If a SQL update fails (DB down,
-network issue), log the error and continue CDR processing. CDR processing
-is always more important than registry updates.
-
-**ENUM casting in PostgreSQL:**
-All status values must be cast explicitly in SQL:
-`'DONE'::processing_status`, `'ERROR'::processing_status`, etc.
-Already included in all templates above.
-
-**Volume and partitioning:**
-For volumes above 5 000 files/day, consider enabling PostgreSQL monthly
-table partitioning on `cdr_registry` using `received_at` as the partition
-key. The batch already runs incrementally (today's files only for most
-checks). See comments in `01_schema.sql` for the migration path.
+```sql
+WITH medians AS (
+    SELECT cdr_type::text,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (updated_at - received_at))
+           ) AS median_s
+    FROM cdr_registry
+    WHERE processing_status = 'DONE'
+      AND received_at >= NOW() - INTERVAL '7 days'
+    GROUP BY cdr_type
+)
+SELECT cr.file_name, cr.operator_id, cr.cdr_type::text,
+       ROUND(EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at))::numeric / 60, 1) AS duration_min,
+       ROUND(m.median_s::numeric / 60, 1) AS median_min,
+       ROUND(EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at)) / m.median_s, 2)  AS ratio
+FROM cdr_registry cr
+JOIN medians m ON cr.cdr_type::text = m.cdr_type
+WHERE cr.processing_status = 'DONE'
+  AND cr.received_at >= CURRENT_DATE
+  AND EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at)) > 3 * m.median_s
+ORDER BY ratio DESC;
+```
 
 ---
 
 ## Validated test scenarios
 
 | # | Scenario | Result |
-|---|---|---|
+|---|----------|--------|
 | 1 | Normal Java processing | PENDING → PROCESSING → DONE ✅ |
-| 2 | ES minutes update | delta 0.06% < 0.5%, no alert ✅ |
+| 2 | ES minutes update | delta 0.06% < 0.5% — no alert ✅ |
 | 3 | FTP transfer verification | checksums match, integrity confirmed ✅ |
-| 4 | Missing records | 36 missing → MISMATCH auto-detected ✅ |
-| 5 | Java crash | ERROR + note written to DB ✅ |
+| 4 | Missing records (36 missing) | MISMATCH auto-detected ✅ |
+| 5 | Java crash | ERROR + error message written to DB ✅ |
 
 ---
 
 ## Files in this project
 
 | File | Purpose |
-|---|---|
-| `trafscan/watcher.py` | File watcher - detects new CDR files, triggers hasher |
+|------|---------|
+| `trafscan/watcher.py` | File watcher — detects new CDR files, triggers hasher |
 | `trafscan/hasher.py` | SHA-256, line count, DB insert; also contains Java SQL templates |
 | `trafscan/db.py` | PostgreSQL connection pool |
 | `trafscan/__main__.py` | Entry point: `python -m trafscan` |
-| `batch.py` | Nightly reconciliation batch - 8 checks (Q1, Q2, Q3a–e, Q4, Q5a, Q5b, Q5c, Q6), report generation |
+| `batch.py` | Nightly reconciliation batch — all checks (Q1–Q7 + Q_PT) |
 | `alerting.py` | HTML report builder, email sender, NOC JSON payload |
-| `simulate_java.py` | Test tool - simulates Java hooks without touching Java code |
+| `simulate_java.py` | Test tool — simulates Java hooks without touching Java code |
 | `verify_ftp.py` | FTP transfer integrity verifier |
 | `config.yaml` | All configuration (DB, watched folders, thresholds, email) |
-| `01_schema.sql` | PostgreSQL schema - run once to initialize the database |
+| `01_schema.sql` | PostgreSQL schema — run once to initialize |
+
+---
+
+## Important notes for integration
+
+**Binary CDR types (msc, pgw, cnn):**
+`record_count_expected` holds the raw newline count of the binary file, which
+is not meaningful for record comparison. The batch automatically excludes these
+types from record count and recharge checks. They are flagged with
+`notes = 'Binary CDR: ...'`.
+
+**file_name is always the basename:**
+`CDR_20250501.gz`, never a full path. Java hooks and the watcher both use
+only the basename when referencing a file.
+
+**Never block on registry failures:**
+The registry is a monitoring layer. If a SQL update fails (DB down, network
+issue), log the error and continue CDR processing. CDR processing is always
+more important than registry updates.
+
+**ENUM casting in PostgreSQL:**
+All status values must be cast explicitly:
+`'DONE'::processing_status`, `'ERROR'::processing_status`, etc.
+Already included in all Java hook templates above.
+
+**Volume and partitioning:**
+For volumes above 5 000 files/day, consider enabling PostgreSQL monthly
+table partitioning on `cdr_registry` using `received_at` as the partition
+key. The batch already runs incrementally (today's files only for most
+checks). See the comments in `01_schema.sql` for the migration path.
+
+---
+
+## Changelog
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0 | Apr 2025 | Initial: Q1, Q2, Q3a (minutes only), Q4, Q5c, Q6 |
+| 2.0 | Apr 2025 | Java hooks refined, FTP verifier |
+| 3.0 | May 2025 | Q3b–Q3e (voice/SMS/data/recharge), Q5a, Q5b |
+| **3.1** | **May 2025** | **Q_PT (processing time), Q7 (forfaits), DB placement clarified, NOC payload v3.1** |

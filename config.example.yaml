@@ -1,0 +1,281 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# TRAFSCAN – Solution A  |  config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# IMPORTANT — DATABASE PLACEMENT:
+#   The CDR Registry (cdr_registry, anomaly_log) must be in the SAME
+#   PostgreSQL database as the Trafscan application (same host, same dbname).
+#   Do NOT create a separate database.
+#
+# HOW TO USE:
+#   1. Copy this file to /opt/trafscan/config.yaml
+#   2. Fill in every section marked with  ← FILL IN
+#   3. Run:  python alerting.py --config config.yaml --test
+#      to verify email before the first real batch run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# -----------------------------------------------------------------------------
+# Database connection (CDR Registry - PostgreSQL)
+# Same host/dbname as the existing Trafscan PostgreSQL instance.
+# -----------------------------------------------------------------------------
+database:
+  host:     localhost
+  port:     5432
+  dbname:   #fill this
+  user:     #fill this
+  password: #fill this
+  pool_min: 2
+  pool_max: 10
+
+# -----------------------------------------------------------------------------
+# File Watcher — watched directories
+# One entry per operator × CDR type combination.
+# The operator and cdr_type come from the folder path, never the filename.
+# -----------------------------------------------------------------------------
+
+# For testing
+watcher:
+  stable_checks:    2
+  stable_interval:  2.0
+  extra_delay:      5.0
+
+  sources:
+    - directory:  C:/cdr_test/atel/in
+      operator:   atel
+      cdr_type:   in
+      extensions: [".gz", ".add.gz", ".add"]
+    - directory:  C:/cdr_test/atel/msc
+      operator:   atel
+      cdr_type:   msc
+      extensions: [".gz", ".dat.gz", ".dat", ""]
+
+
+# watcher:
+#   stable_checks:    6      # Size-equal polls before file is considered stable
+#   stable_interval:  5.0   # Seconds between polls
+#   extra_delay:      30.0  # Extra fixed wait (seconds) after stability confirmed
+
+#   # sentinel_suffix: ".done"   # Uncomment if operators deposit a .done file
+
+#   sources:
+#     - directory:  /opt/backup/orange/in
+#       operator:   orange
+#       cdr_type:   in
+#       extensions: [".gz", ".csv.gz", ".add.gz", ".csv", ".add"]
+
+#     - directory:  /opt/backup/orange/msc
+#       operator:   orange
+#       cdr_type:   msc
+#       extensions: [".gz", ".dat.gz", ".dat", ""]
+
+#     - directory:  /opt/backup/orange/pgw
+#       operator:   orange
+#       cdr_type:   pgw
+#       extensions: [".gz", ".dat.gz", ""]
+
+#     - directory:  /opt/backup/orange/cnn
+#       operator:   orange
+#       cdr_type:   cnn
+#       extensions: [".gz", ""]
+
+#     - directory:  /opt/backup/orange/sdp
+#       operator:   orange
+#       cdr_type:   sdp
+#       extensions: [".gz", ".csv.gz", ".csv", ".ASN", ".ADJ"]
+
+#     - directory:  /opt/backup/atel/in
+#       operator:   atel
+#       cdr_type:   in
+#       extensions: [".gz", ".csv.gz", ".add.gz", ".csv", ".add"]
+
+#     - directory:  /opt/backup/atel/msc
+#       operator:   atel
+#       cdr_type:   msc
+#       extensions: [".gz", ".dat.gz", ".dat", ""]
+
+#     - directory:  /opt/backup/atel/pgw
+#       operator:   atel
+#       cdr_type:   pgw
+#       extensions: [".gz", ".dat.gz", ""]
+
+#     - directory:  /opt/backup/atel/cnn
+#       operator:   atel
+#       cdr_type:   cnn
+#       extensions: [".gz", ""]
+
+#     - directory:  /opt/backup/atel/sdp
+#       operator:   atel
+#       cdr_type:   sdp
+#       extensions: [".gz", ".csv.gz", ".csv", ".ASN", ".ADJ"]
+
+#     - directory:  /opt/backup/moov/in
+#       operator:   moov
+#       cdr_type:   in
+#       extensions: [".gz", ".csv.gz", ".add.gz", ".csv", ".add"]
+
+#     - directory:  /opt/backup/moov/msc
+#       operator:   moov
+#       cdr_type:   msc
+#       extensions: [".gz", ".dat.gz", ".dat", ""]
+
+#     - directory:  /opt/backup/moov/pgw
+#       operator:   moov
+#       cdr_type:   pgw
+#       extensions: [".gz", ".dat.gz", ""]
+
+#     - directory:  /opt/backup/moov/cnn
+#       operator:   moov
+#       cdr_type:   cnn
+#       extensions: [".gz", ""]
+
+#     - directory:  /opt/backup/moov/sdp
+#       operator:   moov
+#       cdr_type:   sdp
+#       extensions: [".gz", ".csv.gz", ".csv", ".ASN", ".ADJ"]
+
+# ── Hasher ────────────────────────────────────────────────────────────────────
+hasher:
+  # Files arriving on frontale are already compressed from the DCS.
+  # Set to false — we record checksum_raw of what we receive as-is.
+  compress_after_hash: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch — reconciliation checks
+# ─────────────────────────────────────────────────────────────────────────────
+batch:
+  # Directory where HTML reports and noc_latest.json are saved
+  report_dir: reports
+ 
+  # Q1 — Stuck files
+  # Files still PENDING or PROCESSING after this many hours trigger an alert.
+  # WARNING at 1×, CRITICAL at 2×.
+  stuck_file_hours: 2
+ 
+  # Q3a–Q3e — DB vs ES divergence threshold (applies to all 5 dimensions)
+  # Percentage above which a DB/ES difference triggers an alert.
+  # WARNING at 1×, CRITICAL at 2×.
+  # NOTE: renamed from 'divergence_pct' in v3.0. If upgrading, update this key.
+  minutes_divergence_pct: 0.5
+ 
+  # Q5a — File count baseline
+  # Expected number of files per operator/type per day.
+  # Format: "operator/cdr_type": N   (N = approximate daily count)
+  # Set to 0 to disable that combination. Omit a key to also disable.
+  # ← FILL IN with actual counts from the team (ask Baha).
+  # ← Leave at 0 until counts are confirmed — no false alerts.
+  file_count_baseline:
+    orange/in:  0    # ← e.g. 120
+    orange/msc: 0    # ← e.g. 80
+    orange/pgw: 0
+    orange/cnn: 0
+    orange/sdp: 0
+    orange/air: 0
+    orange/occ: 0
+    atel/in:    0
+    atel/msc:   0
+    atel/pgw:   0
+    atel/cnn:   0
+    atel/sdp:   0
+    atel/air:   0
+    atel/occ:   0
+    moov/in:    0
+    moov/msc:   0
+    moov/pgw:   0
+    moov/cnn:   0
+    moov/sdp:   0
+    moov/air:   0
+    moov/occ:   0
+ 
+  # Tolerance % for Q5a (±% of baseline that is considered normal)
+  baseline_tolerance_pct: 20
+ 
+  # Q5b — Pipeline funnel
+  # Alert if more than this % of today's files are still PENDING/PROCESSING
+  # at batch run time (02:00).
+  funnel_pending_warning_pct: 10
+ 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Q_PT — Processing time anomaly detection (v3.1)
+  # ─────────────────────────────────────────────────────────────────────────
+  processing_time:
+ 
+    # Minimum DONE files in the 7-day window per cdr_type before
+    # the check activates. Prevents false alerts during initial rollout.
+    min_samples: 10
+ 
+    # Duration multiples of the 7-day median that trigger alerts.
+    warning_multiplier:  3.0    # WARNING  if duration > 3× median
+    critical_multiplier: 5.0    # CRITICAL if duration > 5× median
+ 
+    # Timestamp source:
+    #   false (default) — use updated_at - received_at (fallback, works now)
+    #   true            — use processing_started_at / processing_ended_at
+    #                     Switch to true once Java Hooks 1+2 are confirmed live.
+    use_java_timestamps: false
+ 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Q7 — Forfait daily count (v3.1)
+  # ─────────────────────────────────────────────────────────────────────────
+  forfait:
+    enabled: true
+ 
+    # Alert if today's forfait total drops by more than this % vs 7-day median.
+    drop_warning_pct:  30
+    drop_critical_pct: 70
+ 
+    # Part 2 — ES vs DB comparison (pending team confirmation)
+    # TODO: Ask Baha: does the ES index have a field like cdrType='forfait'
+    # (or equivalent) that can be counted per date?
+    # If yes, set es_enabled: true and fill in the fields below.
+    es_enabled: false
+    # es_index: "forfait_index"   # ← FILL IN once confirmed
+    # es_field: "cdrType"         # ← FILL IN once confirmed
+    # es_value: "forfait"         # ← FILL IN once confirmed
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Email alerting
+# ⚠ NOT YET CONFIGURED — fill in before first production batch run.
+# Test with: python alerting.py --config config.yaml --test
+# ─────────────────────────────────────────────────────────────────────────────
+alerting:
+  smtp_host:     ""       # ← FILL IN  e.g. smtp.gmail.com
+  smtp_port:     587
+  smtp_user:     ""       # ← FILL IN  sender address
+  smtp_password: ""       # ← FILL IN  app password or SMTP token
+  smtp_tls:      true
+  from_email:    ""       # ← FILL IN  usually same as smtp_user
+  to_emails:     []       # ← FILL IN  e.g. [ops@example.com, noc@example.com]
+ 
+  # Which severity levels trigger an email: [CRITICAL] or [CRITICAL, WARNING]
+  alert_on: [CRITICAL, WARNING]
+ 
+  # Optional: POST noc_latest.json to this URL after every batch run.
+  # Leave empty to use file-based polling only.
+  noc_webhook_url: ""     # ← FILL IN or leave empty
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Archiving (for reference — implemented separately from this batch)
+# ─────────────────────────────────────────────────────────────────────────────
+archiving:
+  hot:
+    path:            /opt/backup      # same as watcher sources (already hot)
+    retention_hours: 48
+  warm:
+    path:            /mnt/nas/trafscan    # ← FILL IN
+    retention_days:  10
+    run_every_hours: 6
+  cold:
+    path:            s3://trafscan-archive   # ← FILL IN or tape path
+    retention_days:  365
+    run_at:          "00:00"
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────────
+# Logging
+# ─────────────────────────────────────────────────────────────────────────────
+logging:
+  level: INFO     # DEBUG | INFO | WARNING | ERROR
+  file:  /var/log/trafscan/trafscan.log

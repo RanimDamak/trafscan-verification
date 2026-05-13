@@ -2,10 +2,37 @@
 -- TRAFSCAN - Solution A: CDR Registry Schema
 -- PostgreSQL 16
 -- =============================================================
-
--- ─────────────────────────────────────────────────────────────
+--
+-- Run once against the existing Trafscan PostgreSQL database.
+-- Safe to run multiple times — all CREATE/ALTER statements are idempotent.
+--
+-- IMPORTANT: Run this in the SAME database as the Trafscan application.
+--   Do NOT create a separate database. The Q7 check requires access to
+--   public.daily_state_forfait and public.daily_state_unknown_forfait,
+--   which already exist in the Trafscan DB.
+--
+-- Changes:
+--   • anomaly_type ENUM: added PROCESSING_TIME_ANOMALY, FORFAIT_COUNT_DROP
+--   • cdr_registry: added voice_db/es, sms_db/es, data_db/es, recharge_db/es
+--   • cdr_registry: added updated_at (trigger-managed, used by Q_PT fallback)
+--   • cdr_registry: added processing_started_at / processing_ended_at
+--   • cdr_type ENUM renamed cdr_type → cdr_type_enum to avoid PostgreSQL
+--     column/type name collision (the old schema had both named 'cdr_type')
+--   • 'other' removed from cdr_type_enum (watcher always sets a known type)
+--
+-- MIGRATION NOTE for teams upgrading from v3.0:
+--   If you already have a cdr_registry table with cdr_type='other' rows,
+--   run this first before applying the rest of this script:
+--
+--     UPDATE cdr_registry SET cdr_type = 'in' WHERE cdr_type::text = 'other';
+--
+--   Then re-run this script. The ALTER TABLE blocks below are safe.
+-- ============================================================================
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
 -- ENUM: processing_status
--- ─────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────────────────────────
 DO $$ BEGIN
     CREATE TYPE processing_status AS ENUM (
         'PENDING',
@@ -16,354 +43,335 @@ DO $$ BEGIN
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
-
--- ─────────────────────────────────────────────────────────────
--- ENUM: anomaly_type
--- Extended to cover all 5 divergence dimensions:
---   minutes, voice, SMS, data, recharge
--- NOTE: FORFAITS not yet included — pending team confirmation
---   of table names (see TODO block below)
--- ─────────────────────────────────────────────────────────────
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ENUM: cdr_type_enum
+-- Renamed from 'cdr_type' (v3.0) to avoid collision with the column name.
+-- 'other' removed — the watcher always maps to a known type from the folder path.
+-- ─────────────────────────────────────────────────────────────────────────────
 DO $$ BEGIN
-    CREATE TYPE anomaly_type AS ENUM (
-        'CHECKSUM_MISMATCH',
-        'MISSING_RECORDS',
-        'MINUTES_DIVERGENCE',
-        'VOICE_DIVERGENCE',
-        'SMS_DIVERGENCE',
-        'DATA_DIVERGENCE',
-        'RECHARGE_DIVERGENCE',
-        -- TODO FORFAITS: add 'FORFAIT_DIVERGENCE' once team confirms
-        --   the exact table names (tables known/unknown forfaits in Trafscan DB)
-        --   and whether totals are per-file or globally aggregated.
-        'TIMEOUT',
-        'FILE_MISSING'
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
--- ─────────────────────────────────────────────────────────────
--- ENUM: severity
--- ─────────────────────────────────────────────────────────────
-DO $$ BEGIN
-    CREATE TYPE severity_level AS ENUM (
-        'INFO',
-        'WARNING',
-        'CRITICAL'
-    );
-EXCEPTION WHEN duplicate_object THEN NULL;
-END $$;
-
--- ─────────────────────────────────────────────────────────────
--- ENUM: cdr_type
--- Matches folder structure: /opt/backup/{operator}/{cdr_type}/
--- ─────────────────────────────────────────────────────────────
-DO $$ BEGIN
-    CREATE TYPE cdr_type AS ENUM (
+    CREATE TYPE cdr_type_enum AS ENUM (
         'in',    -- IN CDRs: recharge, voucher (text, AIR format)
         'msc',   -- MSC CDRs: voice (binary Ericsson)
         'pgw',   -- PGW/GGSN CDRs: data (binary IPDR)
         'cnn',   -- CNN/CCN CDRs (binary ASN.1/BER)
         'sdp',   -- SDP CDRs (ASN, ADJ)
         'air',   -- AIR CDRs (text)
-        'occ',   -- OCC CDRs
-        'other'
+        'occ'    -- OCC CDRs
     );
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
-
--- ─────────────────────────────────────────────────────────────
--- TABLE: operators
--- ─────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS operators (
+ 
+-- If the old 'cdr_type' ENUM exists (v3.0 schema), rename it.
+-- Safe no-op if already renamed or doesn't exist.
+DO $$ BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_type WHERE typname = 'cdr_type'
+        AND typtype = 'e'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM pg_type WHERE typname = 'cdr_type_enum'
+    ) THEN
+        ALTER TYPE cdr_type RENAME TO cdr_type_enum;
+        RAISE NOTICE 'Renamed ENUM cdr_type → cdr_type_enum';
+    END IF;
+END $$;
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ENUM: anomaly_type
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$ BEGIN
+    CREATE TYPE anomaly_type AS ENUM (
+        -- Core checks (v1.0)
+        'CHECKSUM_MISMATCH',
+        'MISSING_RECORDS',
+        'MINUTES_DIVERGENCE',
+        'TIMEOUT',
+        'FILE_MISSING',
+        -- DB↔ES traffic dimensions (v3.0)
+        'VOICE_DIVERGENCE',
+        'SMS_DIVERGENCE',
+        'DATA_DIVERGENCE',
+        'RECHARGE_DIVERGENCE',
+        -- New in v3.1
+        'PROCESSING_TIME_ANOMALY',   -- Q_PT: processing duration outlier
+        'FORFAIT_COUNT_DROP'         -- Q7:  daily forfait total collapse
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ 
+-- Add new v3.1 values to an existing anomaly_type ENUM (safe/idempotent)
+DO $$ BEGIN
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'VOICE_DIVERGENCE';
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'SMS_DIVERGENCE';
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'DATA_DIVERGENCE';
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'RECHARGE_DIVERGENCE';
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'PROCESSING_TIME_ANOMALY';
+    ALTER TYPE anomaly_type ADD VALUE IF NOT EXISTS 'FORFAIT_COUNT_DROP';
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ENUM: severity_level
+-- ─────────────────────────────────────────────────────────────────────────────
+DO $$ BEGIN
+    CREATE TYPE severity_level AS ENUM ('INFO', 'WARNING', 'CRITICAL');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TABLE: operators (reference)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.operators (
     operator_id   VARCHAR(50)  PRIMARY KEY,
     operator_name VARCHAR(255) NOT NULL,
     created_at    TIMESTAMP    NOT NULL DEFAULT NOW()
 );
-
--- Known operators
-INSERT INTO operators (operator_id, operator_name) VALUES
+ 
+INSERT INTO public.operators (operator_id, operator_name) VALUES
     ('orange', 'Orange'),
     ('atel',   'Airtel'),
     ('moov',   'Moov')
 ON CONFLICT DO NOTHING;
-
--- ─────────────────────────────────────────────────────────────
--- TABLE: cdr_registry  (source of truth)
--- ─────────────────────────────────────────────────────────────
--- Each row = one CDR file tracked end-to-end through the pipeline.
--- Business value columns (_db / _es pairs) are populated by Java
--- hooks after processing and ES indexing respectively.
--- Binary CDR types (msc, pgw, cnn): record counts are raw newline
--- counts and are NOT meaningful for comparison — excluded from checks.
--- ─────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS cdr_registry (
-
-    -- ── Identity ──────────────────────────────────────────────
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TABLE: cdr_registry (source of truth — one row per CDR file)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Business columns (_db / _es pairs) are populated by Java hooks:
+--   Hook 2 → all _db columns
+--   Hook 4 → all _es columns
+--
+-- Binary CDR types (msc, pgw, cnn): record_count_expected is a raw newline
+-- count of a binary file — meaningless. These types are excluded from
+-- record-count and minutes divergence checks by the batch.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.cdr_registry (
+ 
+    -- Identity
     file_id                  UUID              PRIMARY KEY DEFAULT gen_random_uuid(),
-    file_name                VARCHAR(255)      NOT NULL UNIQUE,
-    operator_id              VARCHAR(50)       NOT NULL REFERENCES operators(operator_id),
-
-    -- Source classification (from folder path, not filename)
-    cdr_type                 cdr_type          NOT NULL DEFAULT 'other',
-
-    -- ── Timestamps ────────────────────────────────────────────
+    file_name                VARCHAR(255)      NOT NULL UNIQUE,   -- basename only, never full path
+    operator_id              VARCHAR(50)       NOT NULL REFERENCES public.operators(operator_id),
+    cdr_type                 cdr_type_enum     NOT NULL,
+ 
+    -- Timestamps
     received_at              TIMESTAMP         NOT NULL DEFAULT NOW(),
-    -- processing_started_at and processing_ended_at are set by Java hooks.
-    -- IMPORTANT: These are ONLY populated once the Trafscan team
-    -- integrates the hook templates provided in README.md.
-    -- Until then they remain NULL. Do NOT use them for processing-time
-    -- alerts until the team confirms integration.
+    -- processing_started_at and processing_ended_at are populated by Java
+    -- Hooks 1 and 2/3 respectively. NULL until the Java team integrates them.
+    -- Q_PT will use them automatically once they are populated.
     processing_started_at    TIMESTAMP,
     processing_ended_at      TIMESTAMP,
     archived_at              TIMESTAMP,
-
-    -- ── Checksums (3 stages — invariant I2) ───────────────────
-    checksum_raw             CHAR(64)          NOT NULL,  -- SHA-256 on DCS reception
-    checksum_compressed      CHAR(64),                   -- SHA-256 after gzip
-    checksum_transferred     CHAR(64),                   -- SHA-256 verified at regulator
-
-    -- ── Record counts (invariant I3) ──────────────────────────
-    record_count_expected    BIGINT            NOT NULL,  -- Counted by Python at reception
-    record_count_processed   BIGINT,                     -- Parsed by Java (set via Hook 2)
-
-    -- ── Minutes: Java DB vs ElasticSearch ─────────────────────
-    -- Populated by Java Hook 2 (DB) and Hook 4 (ES)
-    total_minutes_db         DECIMAL(18, 3),
-    total_minutes_es         DECIMAL(18, 3),
-
-    -- ── Voice traffic: Java DB vs ElasticSearch ───────────────
-    -- Source in Trafscan DB: AbonneTable.voice_counted_balance /
-    --   voice_real_balance aggregated at file level by Java
-    -- Source in ES: equivalent voice fields indexed per file
-    -- Populated by Java Hook 2 (DB) and Hook 4 (ES) — requires
-    -- Trafscan team to expose these aggregates in hooks
-    voice_db                 DECIMAL(18, 3),
-    voice_es                 DECIMAL(18, 3),
-
-    -- ── SMS traffic: Java DB vs ElasticSearch ─────────────────
-    -- Source in Trafscan DB: AbonneTable.sms_counted_balance /
-    --   sms_real_balance aggregated at file level by Java
-    sms_db                   DECIMAL(18, 3),
-    sms_es                   DECIMAL(18, 3),
-
-    -- ── Data traffic: Java DB vs ElasticSearch ────────────────
-    -- Source in Trafscan DB: AbonneTable.data_counted_balance /
-    --   data_real_balance aggregated at file level by Java
-    data_db                  DECIMAL(18, 3),
-    data_es                  DECIMAL(18, 3),
-
-    -- ── Recharge: Java DB vs ElasticSearch ────────────────────
-    -- Source in Trafscan DB: AbonneTable.recharge_balance /
-    --   recharge_count aggregated at file level by Java
-    -- Applies mainly to cdr_type='in' files (recharge CDRs)
-    recharge_db              DECIMAL(18, 3),
-    recharge_es              DECIMAL(18, 3),
-
-    -- ── Forfaits ──────────────────────────────────────────────
-    -- TODO FORFAITS: Forfait reconciliation is NOT per-file.
-    -- There are two separate tables for known and unknown forfaits. Their exact names and field structure
-    -- are pending confirmation. Once received:
-    --   1. Add forfait_db / forfait_es columns here, OR
-    --   2. Implement as a separate reconciliation query against
-    --      those tables rather than per-file columns — depending
-    --      on how Trafscan aggregates forfait data.
-
-    -- ── Pipeline state machine ────────────────────────────────
+    -- updated_at is set by trigger on every UPDATE — used as Q_PT fallback
+    -- before Java hooks are live.
+    updated_at               TIMESTAMP         NOT NULL DEFAULT NOW(),
+ 
+    -- Checksums — SHA-256 at three pipeline stages (invariant I2)
+    checksum_raw             CHAR(64)          NOT NULL,   -- at DCS reception
+    checksum_compressed      CHAR(64),                    -- after gzip
+    checksum_transferred     CHAR(64),                    -- verified at regulator
+ 
+    -- Record counts (invariant I3)
+    record_count_expected    BIGINT            NOT NULL DEFAULT 0,
+    record_count_processed   BIGINT,
+ 
+    -- Q3a: Voice minutes — Java DB vs ElasticSearch
+    total_minutes_db         DECIMAL(18,3),
+    total_minutes_es         DECIMAL(18,3),
+ 
+    -- Q3b: Voice traffic — AbonneTable.voice_counted_balance aggregate
+    voice_db                 DECIMAL(18,3),
+    voice_es                 DECIMAL(18,3),
+ 
+    -- Q3c: SMS traffic — AbonneTable.sms_counted_balance aggregate
+    sms_db                   DECIMAL(18,3),
+    sms_es                   DECIMAL(18,3),
+ 
+    -- Q3d: Data traffic — AbonneTable.data_counted_balance aggregate
+    data_db                  DECIMAL(18,3),
+    data_es                  DECIMAL(18,3),
+ 
+    -- Q3e: Recharge — AbonneTable.recharge_balance aggregate
+    --      Mainly applies to cdr_type='in' files. NULL for other types.
+    recharge_db              DECIMAL(18,3),
+    recharge_es              DECIMAL(18,3),
+ 
+    -- Pipeline state
     processing_status        processing_status NOT NULL DEFAULT 'PENDING',
-
-    -- ── Archive ───────────────────────────────────────────────
+ 
+    -- Archive
     archive_path             VARCHAR(512),
-
-    -- ── Free-form notes / errors ──────────────────────────────
-    notes                    TEXT,
-
-    -- ── Audit ─────────────────────────────────────────────────
-    updated_at               TIMESTAMP         NOT NULL DEFAULT NOW()
+ 
+    -- Free-form notes / error messages
+    notes                    TEXT
 );
-
--- ─────────────────────────────────────────────────────────────
--- TRIGGER: auto-update updated_at
--- ─────────────────────────────────────────────────────────────
-CREATE OR REPLACE FUNCTION set_updated_at()
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TRIGGER: auto-update updated_at on every row change
+-- Used by Q_PT fallback (updated_at - received_at as processing time proxy)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE OR REPLACE FUNCTION public.cdr_registry_set_updated_at()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
 $$;
-
-DROP TRIGGER IF EXISTS trg_cdr_registry_updated_at ON cdr_registry;
+ 
+DROP TRIGGER IF EXISTS trg_cdr_registry_updated_at ON public.cdr_registry;
 CREATE TRIGGER trg_cdr_registry_updated_at
-BEFORE UPDATE ON cdr_registry
-FOR EACH ROW EXECUTE FUNCTION set_updated_at();
-
--- ─────────────────────────────────────────────────────────────
--- TABLE: anomaly_log
--- ─────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS anomaly_log (
-    anomaly_id        UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-    file_id           UUID           REFERENCES cdr_registry(file_id) ON DELETE SET NULL,
-    anomaly_type      anomaly_type   NOT NULL,
-    delta_value       DECIMAL(18, 4),
-    threshold_value   DECIMAL(18, 4),
-    severity          severity_level NOT NULL,
-    detected_at       TIMESTAMP      NOT NULL DEFAULT NOW(),
-    resolved          BOOLEAN        NOT NULL DEFAULT FALSE,
-    resolution_notes  TEXT
+    BEFORE UPDATE ON public.cdr_registry
+    FOR EACH ROW EXECUTE FUNCTION public.cdr_registry_set_updated_at();
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- MIGRATION: Add v3.0/v3.1 columns to an existing installation
+-- All ADD COLUMN IF NOT EXISTS operations are idempotent — safe to re-run.
+-- ─────────────────────────────────────────────────────────────────────────────
+ALTER TABLE public.cdr_registry
+    ADD COLUMN IF NOT EXISTS voice_db              DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS voice_es              DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS sms_db                DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS sms_es                DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS data_db               DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS data_es               DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS recharge_db           DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS recharge_es           DECIMAL(18,3),
+    ADD COLUMN IF NOT EXISTS updated_at            TIMESTAMP NOT NULL DEFAULT NOW(),
+    ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS processing_ended_at   TIMESTAMP,
+    ADD COLUMN IF NOT EXISTS archive_path          VARCHAR(512);
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- TABLE: anomaly_log (one row per detected anomaly)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS public.anomaly_log (
+    anomaly_id       UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_id          UUID           REFERENCES public.cdr_registry(file_id) ON DELETE SET NULL,
+    anomaly_type     anomaly_type   NOT NULL,
+    delta_value      DECIMAL(18,4),
+    threshold_value  DECIMAL(18,4),
+    severity         severity_level NOT NULL,
+    detected_at      TIMESTAMP      NOT NULL DEFAULT NOW(),
+    resolved         BOOLEAN        NOT NULL DEFAULT FALSE,
+    resolution_notes TEXT
 );
-
--- ─────────────────────────────────────────────────────────────
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
 -- INDEXES
--- ─────────────────────────────────────────────────────────────
-
+-- ─────────────────────────────────────────────────────────────────────────────
+ 
 -- Primary batch filter: files by status
 CREATE INDEX IF NOT EXISTS idx_registry_status
-    ON cdr_registry (processing_status);
-
+    ON public.cdr_registry (processing_status);
+ 
 -- Operator + date range reports
 CREATE INDEX IF NOT EXISTS idx_registry_operator_date
-    ON cdr_registry (operator_id, received_at);
-
+    ON public.cdr_registry (operator_id, received_at);
+ 
 CREATE INDEX IF NOT EXISTS idx_registry_operator_type
-    ON cdr_registry (operator_id, cdr_type);
-
-CREATE INDEX IF NOT EXISTS idx_registry_cdr_type
-    ON cdr_registry (cdr_type);
-
--- Date-only lookups (stuck-file detection, batch window)
+    ON public.cdr_registry (operator_id, cdr_type);
+ 
+-- Date-only lookups (stuck file detection, batch window)
 CREATE INDEX IF NOT EXISTS idx_registry_received_at
-    ON cdr_registry (received_at);
-
--- Fast name lookup (UNIQUE already creates a btree, this is explicit)
+    ON public.cdr_registry (received_at);
+ 
+-- Fast name lookup
 CREATE INDEX IF NOT EXISTS idx_registry_filename
-    ON cdr_registry (file_name);
-
--- Anomaly JOIN + time filter
+    ON public.cdr_registry (file_name);
+ 
+-- Q_PT: 7-day rolling median query
+CREATE INDEX IF NOT EXISTS idx_registry_processing_time
+    ON public.cdr_registry (cdr_type, processing_status, received_at, updated_at)
+    WHERE processing_status = 'DONE';
+ 
+-- anomaly JOIN + time filter
 CREATE INDEX IF NOT EXISTS idx_anomaly_file
-    ON anomaly_log (file_id, detected_at);
-
+    ON public.anomaly_log (file_id, detected_at);
+ 
 -- Open critical anomalies
 CREATE INDEX IF NOT EXISTS idx_anomaly_severity
-    ON anomaly_log (severity, resolved);
-
--- ─────────────────────────────────────────────────────────────
--- BIG DATA PARTITIONING
--- For volumes > 5000 files/day, partition cdr_registry by month.
--- Apply once daily file counts exceed PostgreSQL planner thresholds.
--- Migration path (run once when ready):
+    ON public.anomaly_log (severity, resolved);
+ 
+-- Anomaly type + date (for Q7 trend queries)
+CREATE INDEX IF NOT EXISTS idx_anomaly_type_date
+    ON public.anomaly_log (anomaly_type, detected_at);
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Q7 PREREQUISITE CHECK
+-- Verify that the forfait tables exist in this database.
+-- If this raises an exception, you are running against the wrong database.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- DO $$
+-- BEGIN
+--     IF NOT EXISTS (
+--         SELECT 1 FROM information_schema.tables
+--         WHERE table_schema = 'public' AND table_name = 'daily_state_forfait'
+--     ) THEN
+--         RAISE EXCEPTION
+--             'Q7 SETUP ERROR: public.daily_state_forfait not found. '
+--             'This schema must be applied to the SAME database as the Trafscan '
+--             'application (same host, same dbname). Do not use a separate DB.';
+--     END IF;
+ 
+--     IF NOT EXISTS (
+--         SELECT 1 FROM information_schema.tables
+--         WHERE table_schema = 'public' AND table_name = 'daily_state_unknown_forfait'
+--     ) THEN
+--         RAISE EXCEPTION
+--             'Q7 SETUP ERROR: public.daily_state_unknown_forfait not found. '
+--             'Ensure the Trafscan application DB schema is up to date.';
+--     END IF;
+ 
+--     RAISE NOTICE 'Q7 prerequisite check OK: both forfait tables found.';
+-- END $$;
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PARTITIONING NOTE
+-- For volumes > 5 000 files/day, convert cdr_registry to a partitioned table:
 --
---   CREATE TABLE cdr_registry_2025_04
+--   CREATE TABLE cdr_registry_2025_06
 --       PARTITION OF cdr_registry
---       FOR VALUES FROM ('2025-04-01') TO ('2025-05-01');
+--       FOR VALUES FROM ('2025-06-01') TO ('2025-07-01');
 --
--- Alternatively, use pg_partman extension for automated monthly
--- partition creation and retention management.
--- ─────────────────────────────────────────────────────────────
-
-
--- ─────────────────────────────────────────────────────────────
--- MIGRATION: Add new columns to existing installation
--- Run this block if upgrading from schema without traffic dimensions.
--- Safe to run multiple times (ADD COLUMN IF NOT EXISTS).
--- ─────────────────────────────────────────────────────────────
-DO $$
-BEGIN
-    -- Voice
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='voice_db') THEN
-        ALTER TABLE cdr_registry ADD COLUMN voice_db DECIMAL(18, 3);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='voice_es') THEN
-        ALTER TABLE cdr_registry ADD COLUMN voice_es DECIMAL(18, 3);
-    END IF;
-    -- SMS
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='sms_db') THEN
-        ALTER TABLE cdr_registry ADD COLUMN sms_db DECIMAL(18, 3);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='sms_es') THEN
-        ALTER TABLE cdr_registry ADD COLUMN sms_es DECIMAL(18, 3);
-    END IF;
-    -- Data
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='data_db') THEN
-        ALTER TABLE cdr_registry ADD COLUMN data_db DECIMAL(18, 3);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='data_es') THEN
-        ALTER TABLE cdr_registry ADD COLUMN data_es DECIMAL(18, 3);
-    END IF;
-    -- Recharge
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='recharge_db') THEN
-        ALTER TABLE cdr_registry ADD COLUMN recharge_db DECIMAL(18, 3);
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
-                   WHERE table_name='cdr_registry' AND column_name='recharge_es') THEN
-        ALTER TABLE cdr_registry ADD COLUMN recharge_es DECIMAL(18, 3);
-    END IF;
-END $$;
-
-
--- =============================================================
--- VERIFICATION QUERIES (run after migration to confirm)
--- =============================================================
-
--- Q0: Basic sanity
--- SELECT COUNT(*) FROM cdr_registry;   -- expect 0 on fresh install
--- SELECT COUNT(*) FROM operators;      -- expect 3
--- \d cdr_registry                      -- confirm all columns present
-
--- Q1: Stuck files (> 2h)
-/*
-SELECT file_name, operator_id, cdr_type, received_at,
-       EXTRACT(EPOCH FROM (NOW() - received_at)) / 60 AS minutes_waiting,
-       processing_status
-FROM cdr_registry
-WHERE processing_status IN ('PENDING', 'PROCESSING')
-  AND received_at < NOW() - INTERVAL '2 hours'
-ORDER BY received_at ASC;
-*/
-
--- Q2: Checksum mismatch
-/*
-SELECT file_name, operator_id, cdr_type, checksum_raw,
-       checksum_compressed, checksum_transferred,
-       CASE
-           WHEN checksum_compressed IS NOT NULL
-                AND checksum_compressed != checksum_transferred THEN 'ALTERED_TRANSFER'
-           WHEN checksum_compressed IS NULL
-                AND checksum_raw != checksum_transferred        THEN 'ALTERED_TRANSFER'
-           ELSE 'OK'
-       END AS integrity_status
-FROM cdr_registry
-WHERE checksum_transferred IS NOT NULL
-  AND (
-      (checksum_compressed IS NOT NULL AND checksum_compressed != checksum_transferred)
-   OR (checksum_compressed IS NULL     AND checksum_raw        != checksum_transferred)
-  )
-ORDER BY received_at DESC;
-*/
-
+-- Or use pg_partman for automated monthly partition management.
+-- The batch already runs incrementally (today's data only for most checks)
+-- so partitioning is not required at moderate volumes.
+-- ─────────────────────────────────────────────────────────────────────────────
+ 
+ 
+-- ─────────────────────────────────────────────────────────────────────────────
+-- VERIFICATION QUERIES  (uncomment to run after migration)
+-- ─────────────────────────────────────────────────────────────────────────────
+ 
+-- Schema sanity check
+-- SELECT COUNT(*) FROM cdr_registry;    -- expect 0 on fresh install
+-- SELECT COUNT(*) FROM operators;       -- expect 3
+-- \d cdr_registry                       -- confirm all columns present
+ 
 -- Q3a: Minutes divergence DB vs ES (text CDRs only)
 /*
 SELECT file_name, operator_id, cdr_type,
        total_minutes_db, total_minutes_es,
-       ABS(total_minutes_db - total_minutes_es) AS delta_minutes,
        ROUND(ABS(total_minutes_db - total_minutes_es)
              / NULLIF(total_minutes_db, 0) * 100, 2) AS delta_pct
 FROM cdr_registry
 WHERE processing_status = 'DONE'
   AND total_minutes_db IS NOT NULL AND total_minutes_es IS NOT NULL
-  AND ABS(total_minutes_db - total_minutes_es) / NULLIF(total_minutes_db, 0) > 0.01
+  AND ABS(total_minutes_db - total_minutes_es) / NULLIF(total_minutes_db, 0) > 0.005
   AND cdr_type NOT IN ('msc', 'pgw', 'cnn')
 ORDER BY delta_pct DESC;
 */
-
--- Q3b: Voice divergence DB vs ES
+ 
+-- Q3b: Voice divergence
 /*
 SELECT file_name, operator_id, cdr_type,
        voice_db, voice_es,
@@ -371,70 +379,44 @@ SELECT file_name, operator_id, cdr_type,
 FROM cdr_registry
 WHERE processing_status = 'DONE'
   AND voice_db IS NOT NULL AND voice_es IS NOT NULL
-  AND ABS(voice_db - voice_es) / NULLIF(voice_db, 0) > 0.01
+  AND ABS(voice_db - voice_es) / NULLIF(voice_db, 0) > 0.005
 ORDER BY delta_pct DESC;
 */
-
--- Q3c: SMS divergence DB vs ES
+ 
+-- Q3c: SMS divergence (same pattern, replace voice_ with sms_)
+-- Q3d: Data divergence (replace voice_ with data_)
+-- Q3e: Recharge divergence (replace voice_ with recharge_, add AND cdr_type='in')
+ 
+-- Q_PT: Processing time outliers (7-day rolling median, fallback mode)
 /*
-SELECT file_name, operator_id, cdr_type,
-       sms_db, sms_es,
-       ROUND(ABS(sms_db - sms_es) / NULLIF(sms_db, 0) * 100, 2) AS delta_pct
-FROM cdr_registry
-WHERE processing_status = 'DONE'
-  AND sms_db IS NOT NULL AND sms_es IS NOT NULL
-  AND ABS(sms_db - sms_es) / NULLIF(sms_db, 0) > 0.01
-ORDER BY delta_pct DESC;
+WITH medians AS (
+    SELECT cdr_type::text,
+           PERCENTILE_CONT(0.5) WITHIN GROUP (
+               ORDER BY EXTRACT(EPOCH FROM (updated_at - received_at))
+           ) AS median_s
+    FROM cdr_registry
+    WHERE processing_status = 'DONE'
+      AND received_at >= NOW() - INTERVAL '7 days'
+    GROUP BY cdr_type
+)
+SELECT cr.file_name, cr.operator_id, cr.cdr_type::text,
+       ROUND(EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at))::numeric / 60, 1) AS duration_min,
+       ROUND(m.median_s::numeric / 60, 1) AS median_min,
+       ROUND(EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at)) / m.median_s, 2) AS ratio
+FROM cdr_registry cr
+JOIN medians m ON cr.cdr_type::text = m.cdr_type
+WHERE cr.processing_status = 'DONE'
+  AND cr.received_at >= CURRENT_DATE
+  AND EXTRACT(EPOCH FROM (cr.updated_at - cr.received_at)) > 3 * m.median_s
+ORDER BY ratio DESC;
 */
-
--- Q3d: Data divergence DB vs ES
+ 
+-- Q7: Today's forfait totals
 /*
-SELECT file_name, operator_id, cdr_type,
-       data_db, data_es,
-       ROUND(ABS(data_db - data_es) / NULLIF(data_db, 0) * 100, 2) AS delta_pct
-FROM cdr_registry
-WHERE processing_status = 'DONE'
-  AND data_db IS NOT NULL AND data_es IS NOT NULL
-  AND ABS(data_db - data_es) / NULLIF(data_db, 0) > 0.01
-ORDER BY delta_pct DESC;
-*/
-
--- Q3e: Recharge divergence DB vs ES (in CDRs only)
-/*
-SELECT file_name, operator_id,
-       recharge_db, recharge_es,
-       ROUND(ABS(recharge_db - recharge_es) / NULLIF(recharge_db, 0) * 100, 2) AS delta_pct
-FROM cdr_registry
-WHERE processing_status = 'DONE'
-  AND recharge_db IS NOT NULL AND recharge_es IS NOT NULL
-  AND ABS(recharge_db - recharge_es) / NULLIF(recharge_db, 0) > 0.01
-  AND cdr_type = 'in'
-ORDER BY delta_pct DESC;
-*/
-
--- Q4: Missing records (text CDRs only)
-/*
-SELECT file_name, operator_id, cdr_type,
-       record_count_expected, record_count_processed,
-       record_count_expected - record_count_processed AS missing_records,
-       ROUND((record_count_expected - record_count_processed)
-             / NULLIF(record_count_expected, 0) * 100, 2) AS missing_pct
-FROM cdr_registry
-WHERE processing_status = 'DONE'
-  AND record_count_processed < record_count_expected
-  AND notes NOT LIKE '%Binary CDR%'
-ORDER BY missing_records DESC;
-*/
-
--- Q5: Daily summary per operator and type
-/*
-SELECT operator_id, cdr_type, DATE(received_at) AS day,
-       COUNT(*) AS total_files,
-       SUM(CASE WHEN processing_status = 'DONE'      THEN 1 ELSE 0 END) AS done,
-       SUM(CASE WHEN processing_status = 'PENDING'   THEN 1 ELSE 0 END) AS pending,
-       SUM(CASE WHEN processing_status = 'MISMATCH'  THEN 1 ELSE 0 END) AS mismatch,
-       SUM(CASE WHEN processing_status = 'ERROR'     THEN 1 ELSE 0 END) AS error
-FROM cdr_registry
-GROUP BY operator_id, cdr_type, DATE(received_at)
-ORDER BY day DESC, operator_id, cdr_type;
+SELECT
+    CURRENT_DATE AS date,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_forfait         WHERE date = CURRENT_DATE) AS known,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_unknown_forfait WHERE date = CURRENT_DATE) AS unknown,
+    (SELECT COALESCE(SUM(count),0) FROM daily_state_forfait         WHERE date = CURRENT_DATE)
+  + (SELECT COALESCE(SUM(count),0) FROM daily_state_unknown_forfait WHERE date = CURRENT_DATE) AS total;
 */
