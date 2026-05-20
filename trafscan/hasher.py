@@ -44,6 +44,10 @@ _CHUNK = 8192
 # batch knows not to compare record_count_expected vs record_count_processed.
 BINARY_CDR_TYPES = {"msc", "pgw", "cnn"}
 
+# Extensions that indicate a file is already compressed on arrival.
+# These files must NOT be re-compressed by the hasher.
+PRE_COMPRESSED_EXTENSIONS = (".gz",)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level helpers
@@ -58,17 +62,26 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def count_lines(path: str) -> int:
+def is_pre_compressed(file_path: str) -> bool:
+    """Return True if the file arrived already compressed (e.g. .gz)."""
+    return file_path.lower().endswith(PRE_COMPRESSED_EXTENSIONS)
+
+
+def count_records_smart(file_path: str) -> int:
     """
-    Count newlines in a CDR file (streaming).
-    For text CDRs (in, sdp, air): this equals the record count.
-    For binary CDRs (msc, pgw, cnn): this number is meaningless —
-    caller should note this via the cdr_type check.
+    Count CDR records (lines) in a file.
+
+    - For pre-compressed files (.gz): decompresses in streaming mode
+      (no full decompression to disk) and counts newlines in the raw content.
+      This gives the actual number of CDR records, not the compressed line count.
+    - For plain files: streaming newline count.
+
+    Safe for multi-GB files in both cases.
+    Falls back to raw byte count if the gzip header is invalid.
     """
-    lower = path.lower()
-    if lower.endswith(".gz"):
-        return _count_lines_gz(path)
-    return _count_lines_plain(path)
+    if file_path.lower().endswith(".gz"):
+        return _count_lines_gz(file_path)
+    return _count_lines_plain(file_path)
 
 
 def _count_lines_plain(path: str) -> int:
@@ -145,9 +158,12 @@ class Hasher:
         t0 = time.monotonic()
         is_binary = cdr_type.lower() in BINARY_CDR_TYPES
 
+        # FIX H2/H3: detect pre-compression status once, used in multiple steps below
+        pre_compressed = is_pre_compressed(file_path)
+
         log.info(
-            "[hasher] Processing: %s  (id=%s  operator=%s  type=%s  binary=%s)",
-            file_name, file_id, operator_id, cdr_type, is_binary
+            "[hasher] Processing: %s  (id=%s  operator=%s  type=%s  binary=%s  pre_compressed=%s)",
+            file_name, file_id, operator_id, cdr_type, is_binary, pre_compressed
         )
 
         # ── Step 1: SHA-256 raw ───────────────────────────────────────────────
@@ -159,11 +175,13 @@ class Hasher:
 
         log.info("[hasher] SHA-256 raw: %s", checksum_raw)
 
-        # ── Step 2: Count lines ───────────────────────────────────────────────
+        # ── Step 2: Count records (FIX H1: use count_records_smart) ──────────
+        # count_records_smart() decompresses .gz in streaming mode → actual
+        # CDR record count, not compressed binary line count.
         try:
-            record_count = count_lines(file_path)
+            record_count = count_records_smart(file_path)
         except Exception as exc:
-            log.error("[hasher] Line count failed for %s: %s", file_path, exc)
+            log.error("[hasher] Record count failed for %s: %s", file_path, exc)
             record_count = 0
 
         if is_binary:
@@ -186,6 +204,7 @@ class Hasher:
                 checksum_raw=checksum_raw,
                 record_count_expected=record_count,
                 is_binary=is_binary,
+                pre_compressed=pre_compressed,   # FIX H2: pass flag to INSERT
             )
             if not inserted:
                 log.warning("[hasher] Duplicate file, skipping: %s", file_name)
@@ -196,8 +215,16 @@ class Hasher:
         elapsed = time.monotonic() - t0
         log.info("[hasher] INSERT OK in %.2fs  |  file=%s", elapsed, file_name)
 
-        # ── Step 4: Optional compression ─────────────────────────────────────
-        if self._compress and not file_path.endswith(".gz"):
+        # ── Step 4: Compression / checksum_compressed ─────────────────────────
+        # FIX H3: For pre-compressed files, checksum_compressed = checksum_raw
+        # (the file is already its own compressed form). No re-compression.
+        if pre_compressed:
+            self._set_checksum_compressed(file_id, checksum_raw)
+            log.info(
+                "[hasher] Pre-compressed file: checksum_compressed set to checksum_raw (%s)",
+                checksum_raw
+            )
+        elif self._compress:
             self._compress_and_update(file_path, file_id, file_name, checksum_raw)
 
         return file_id
@@ -231,12 +258,21 @@ class Hasher:
         checksum_raw: str,
         record_count_expected: int,
         is_binary: bool,
+        pre_compressed: bool,       # FIX H2: new parameter
     ) -> bool:
         """
         INSERT a PENDING row. Returns False if file_name already exists (duplicate).
         """
-        notes = "Binary CDR: record_count_expected is raw line count, not meaningful." \
-                if is_binary else None
+        notes_parts = []
+        if is_binary:
+            notes_parts.append(
+                "Binary CDR: record_count_expected is raw line count, not meaningful."
+            )
+        if pre_compressed:
+            notes_parts.append(
+                "Pre-compressed: file arrived as .gz; record_count is decompressed line count."
+            )
+        notes = " | ".join(notes_parts) if notes_parts else None
 
         sql = """
             INSERT INTO cdr_registry (
@@ -248,10 +284,11 @@ class Hasher:
                 checksum_raw,
                 record_count_expected,
                 processing_status,
+                is_pre_compressed,
                 notes
             )
             VALUES (
-                %s, %s, %s, %s, NOW(), %s, %s, 'PENDING', %s
+                %s, %s, %s, %s, NOW(), %s, %s, 'PENDING', %s, %s
             )
             ON CONFLICT (file_name) DO NOTHING
         """
@@ -263,11 +300,28 @@ class Hasher:
                 cdr_type,
                 checksum_raw,
                 record_count_expected,
+                pre_compressed,     # FIX H2: write is_pre_compressed to DB
                 notes,
             ))
             inserted = cur.rowcount > 0
             conn.commit()
         return inserted
+
+    def _set_checksum_compressed(self, file_id: str, checksum: str) -> None:
+        """
+        FIX H3: For pre-compressed files, set checksum_compressed = checksum_raw
+        immediately after INSERT. No gzip subprocess needed.
+        """
+        conn = self.pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE cdr_registry SET checksum_compressed=%s, updated_at=NOW() WHERE file_id=%s",
+                    (checksum, file_id),
+                )
+                conn.commit()
+        finally:
+            self.pool.putconn(conn)
 
     def _compress_and_update(self, src_path, file_id, file_name, checksum_raw):
         try:

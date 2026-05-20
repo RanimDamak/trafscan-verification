@@ -29,7 +29,12 @@
 --   Then re-run this script. The ALTER TABLE blocks below are safe.
 -- ============================================================================
  
- 
+
+ALTER TABLE public.cdr_registry
+    ADD COLUMN IF NOT EXISTS is_pre_compressed BOOLEAN DEFAULT FALSE,
+    ADD COLUMN IF NOT EXISTS file_size_bytes BIGINT;
+
+
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ENUM: processing_status
 -- ─────────────────────────────────────────────────────────────────────────────
