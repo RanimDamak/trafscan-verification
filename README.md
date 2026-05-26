@@ -2,7 +2,7 @@
 
 ## Integration Guide for Trafscan
 
-**Version 3.1 - May 2026**
+**Version 3.2.2 - May 2026**
 
 ---
 
@@ -555,6 +555,25 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
+### Run the prediction engine (hourly)
+
+```bash
+# Linux - add to crontab (runs at minute 5 of every hour)
+5 * * * * cd /opt/trafscan && python predictor.py --config config.yaml >> logs/predictor.log 2>&1
+```
+
+Windows Task Scheduler:
+- Program: `python`
+- Arguments: `predictor.py --config config.yaml`
+- Start in: `C:\path\to\trafscan`
+- Trigger: Daily, repeat every 1 hour
+
+Options:
+- `--dry-run` — print predictions without writing to DB
+- `--hours-ahead N` — predict N hours ahead (default: 24)
+- `--clear-future` — delete unconfirmed future predictions and re-run
+- `--reference-date YYYY-MM-DD` — override today's date (testing only)
+
 ### Run the nightly batch (02:00 every night)
 
 ```bash
@@ -873,6 +892,7 @@ ORDER BY ratio DESC;
 | `01_schema.sql` | PostgreSQL schema - run once to initialize |
 | `02_schema_v32.sql` | v3.2 schema migration - prediction tables, Q8/Q9 ENUM values, pre-compressed columns |
 | `seed.py` | Dev utility - seeds prediction_baseline with historical CDR volume data from CDRTextfiles/ for local testing |
+| `predictor.py` | Hourly prediction engine - computes expected CDR file volumes for next 24h, writes to prediction_baseline (run hourly via cron) |
 
 ---
 
@@ -913,6 +933,7 @@ checks). See the comments in `01_schema.sql` for the migration path.
 | 1.0 | Apr 2025 | Initial: Q1, Q2, Q3a (minutes only), Q4, Q5c, Q6 |
 | 2.0 | Apr 2025 | Java hooks refined, FTP verifier |
 | 3.0 | May 2025 | Q3b–Q3e (voice/SMS/data/recharge), Q5a, Q5b |
-| **3.1** | **May 2025** | **Q_PT (processing time), Q7 (forfaits), DB placement clarified, NOC payload v3.1** |
-| **3.2** | **May 2025** | **Couche 5: Q8/Q9 prediction checks, pre-compressed CDR fix (hasher), prediction_baseline and prediction_actuals tables** |
-| **3.2.1** | **May 2025** | **seed.py: seeds prediction_baseline from CDRTextfiles July 2025 history (Option B — aggregated daily/hourly counts, not individual rows in cdr_registry)** |
+| 3.1 | May 2025 | Q_PT (processing time), Q7 (forfaits), DB placement clarified, NOC payload v3.1 |
+| 3.2 | May 2025 | Couche 5: Q8/Q9 prediction checks, pre-compressed CDR fix (hasher), prediction_baseline and prediction_actuals tables |
+| 3.2.1 | May 2025 | seed.py: seeds prediction_baseline from CDRTextfiles July 2025 history (aggregated daily/hourly counts, not individual rows in cdr_registry) |
+| **3.2.2** | **May 2026** | **predictor.py: hourly prediction engine (Phase 2) - weighted average model (60% weekly baseline + 30% recent trend + 10% hour weight), writes hourly + daily rows to prediction_baseline, ON CONFLICT DO NOTHING, --reference-date for testing** |
