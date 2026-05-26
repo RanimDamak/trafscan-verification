@@ -21,7 +21,7 @@ The registry answers these questions in real time with a single SQL query:
 - Are forfait counts collapsing unexpectedly?
 
 It runs alongside the existing Trafscan system. It does not modify any
-existing code — it only **adds** SQL calls at key points in the Java pipeline.
+existing code - it only **adds** SQL calls at key points in the Java pipeline.
 
 ---
 
@@ -40,11 +40,12 @@ copy config.example.yaml config.yaml   # Windows
 # cp config.example.yaml config.yaml   # Linux/Mac
 
 # 4. Fill in config.yaml: database credentials, SMTP, watcher paths
-#    (config.yaml is gitignored — never committed)
+#    (config.yaml is gitignored - never committed)
 
 # 5. Apply the schema to the Trafscan PostgreSQL database
 #    (must be the same DB as the Trafscan application)
 psql -h localhost -p 5432 -U trafscan_verify -d trafscan -f 01_schema.sql
+psql -h localhost -p 5432 -U trafscan_verify -d trafscan -f 02_schema.sql
 
 # 6. Test the HTML report template (no DB needed)
 python alerting.py --config config.yaml --test
@@ -68,7 +69,7 @@ python -m trafscan --config config.yaml
 (used by check Q7) already exist in the Trafscan DB. If the registry were in a
 separate DB, Q7 would need a second connection and a cross-DB query, which
 PostgreSQL does not support natively. The Java hooks also benefit from reusing
-the existing JDBC connection pool — no new datasource to configure.
+the existing JDBC connection pool - no new datasource to configure.
 
 **In practice:** same `host`, same `dbname` in `config.yaml`. Use a dedicated
 PostgreSQL user `trafscan_verify` with INSERT/UPDATE/SELECT on `cdr_registry`,
@@ -99,7 +100,7 @@ Layer 1: File Watcher + Hasher (Python)
     - Inserts row into cdr_registry with status PENDING
     │
     ▼
-Layer 2: CDR Registry (PostgreSQL — same DB as Trafscan app)
+Layer 2: CDR Registry (PostgreSQL - same DB as Trafscan app)
     - Table: cdr_registry    ← source of truth for every file
     - Table: anomaly_log     ← all detected anomalies
     - Table: operators       ← operator reference
@@ -121,7 +122,7 @@ Layer 3: Reconciliation Batch (Python, runs at 02:00)
     │
     ▼
 Layer 4: Alerting + Reporting
-    - Email alert (SMTP — requires configuration, see below)
+    - Email alert (SMTP - requires configuration, see below)
     - HTML daily report saved to reports/
     - noc_latest.json for frontend / NOC panel integration
 ```
@@ -136,9 +137,9 @@ to be detected automatically:
 ```
 /opt/backup/
     orange/
-        in/       ← IN CDRs (recharge, voucher — text format)
-        msc/      ← MSC CDRs (voice — binary Ericsson format)
-        pgw/      ← PGW/GGSN CDRs (data — binary IPDR format)
+        in/       ← IN CDRs (recharge, voucher - text format)
+        msc/      ← MSC CDRs (voice - binary Ericsson format)
+        pgw/      ← PGW/GGSN CDRs (data - binary IPDR format)
         cnn/      ← CNN/CCN CDRs (binary ASN.1/BER format)
         sdp/      ← SDP CDRs (ASN, ADJ formats)
         air/      ← AIR CDRs (text format)
@@ -158,7 +159,7 @@ the filename. This is the authoritative source.
 
 ---
 
-## All checks (v3.1)
+## All checks (v3.2)
 
 | Check | What it detects | Severity |
 |-------|-----------------|----------|
@@ -176,6 +177,8 @@ the filename. This is the authoritative source.
 | **Q6** | Daily summary per operator/type (informational) | INFO |
 | **Q_PT** | Processing duration > N× 7-day rolling median per cdr_type | WARNING / CRITICAL |
 | **Q7** | Daily forfait count vs 7-day median (daily_state_forfait + daily_state_unknown_forfait) | WARNING / CRITICAL |
+| **Q8** | Hourly volume vs prediction - drop or surge vs expected files/records | WARNING / CRITICAL |
+| **Q9** | Daily volume vs prediction - end-of-day completeness check | WARNING / CRITICAL |
 
 ---
 
@@ -206,11 +209,13 @@ the filename. This is the authoritative source.
 | sms_es | DECIMAL(18,3) | SMS traffic balance from ElasticSearch (Hook 4) |
 | data_db | DECIMAL(18,3) | Data traffic balance from Java → DB (Hook 2) |
 | data_es | DECIMAL(18,3) | Data traffic balance from ElasticSearch (Hook 4) |
-| recharge_db | DECIMAL(18,3) | Recharge balance from Java → DB (Hook 2) — in CDRs only |
+| recharge_db | DECIMAL(18,3) | Recharge balance from Java → DB (Hook 2) - in CDRs only |
 | recharge_es | DECIMAL(18,3) | Recharge balance from ElasticSearch (Hook 4) |
 | processing_status | ENUM | PENDING / PROCESSING / DONE / ERROR / MISMATCH |
 | archive_path | VARCHAR(512) | Path to warm/cold archive (NULL if not archived yet) |
 | notes | TEXT | Error messages, flags, free-form notes |
+| is_pre_compressed | BOOLEAN | True if file arrived already compressed (.gz) - record count is decompressed line count |
+| file_size_bytes | BIGINT | File size in bytes at reception (optional, populated by hasher) |
 
 **Source mapping (Trafscan DB → registry columns):**
 - `voice_db` ← `AbonneTable.voice_counted_balance` aggregated per file
@@ -245,17 +250,17 @@ You need to add **4 SQL calls** to the existing CDR processing code.
 These are standard JDBC PreparedStatement calls against the Trafscan
 PostgreSQL database.
 
-Use the **same connection pool** as the existing Trafscan application —
+Use the **same connection pool** as the existing Trafscan application -
 same host, same dbname. No new datasource is needed.
 
 ### JDBC connection
 
 ```java
-// Reuse your existing Trafscan DB connection pool — same host, same dbname.
+// Reuse your existing Trafscan DB connection pool - same host, same dbname.
 Connection trafscanConn = /* your existing pool */ ;
 ```
 
-### Hook 1 — Before processing starts
+### Hook 1 - Before processing starts
 
 Call immediately before your CDR parsing loop begins.
 `fileName` is the basename of the file (e.g. `CDR_20250401_atel.gz`).
@@ -275,12 +280,12 @@ try (PreparedStatement ps = trafscanConn.prepareStatement(sqlStart)) {
     trafscanConn.commit();
     if (updated == 0) {
         logger.warn("TRAFSCAN: file not in registry: " + fileName);
-        // Do NOT block processing — log and continue
+        // Do NOT block processing - log and continue
     }
 }
 ```
 
-### Hook 2 — After processing succeeds
+### Hook 2 - After processing succeeds
 
 Call after your CDR parsing loop completes successfully. Include all
 traffic aggregates computed during parsing.
@@ -322,7 +327,7 @@ try (PreparedStatement ps = trafscanConn.prepareStatement(sqlDone)) {
 > for MSC voice files, or `data_db` for IN recharge files), pass `null`:
 > `ps.setNull(7, Types.DECIMAL)`. All batch checks handle NULL gracefully.
 
-### Hook 3 — In the catch block (Java error)
+### Hook 3 - In the catch block (Java error)
 
 Call inside your existing catch block.
 
@@ -346,7 +351,7 @@ try (PreparedStatement ps = trafscanConn.prepareStatement(sqlError)) {
 }
 ```
 
-### Hook 4 — After ElasticSearch indexing
+### Hook 4 - After ElasticSearch indexing
 
 Call after indexing the file's data in ES. Pass the same traffic values
 as reported by ES so the divergence check is meaningful.
@@ -415,11 +420,11 @@ YourCDRProcessor.process(file):
 
 ---
 
-## Q5a — Daily file count vs baseline
+## Q5a - Daily file count vs baseline
 
 For each operator × CDR type, compares today's received file count against
 a configured expected baseline. This detects days where significantly fewer
-(or more) files arrived than normal — something the watcher alone cannot catch
+(or more) files arrived than normal - something the watcher alone cannot catch
 because it only reacts to files that actually land.
 
 **Severity:**
@@ -431,7 +436,7 @@ because it only reacts to files that actually land.
 ```yaml
 batch:
   file_count_baseline:
-    orange/in:  4        # ← approximate files/day — fill in once team provides counts
+    orange/in:  4        # ← approximate files/day - fill in once team provides counts
     orange/msc: 24
     orange/pgw: 0        # ← 0 = disabled for this combination (no alert)
     atel/in:    4
@@ -442,12 +447,12 @@ batch:
 ```
 
 Leave any value as `0` until the team provides the approximate daily count
-for that combination. The batch will skip it — no false alerts during the
+for that combination. The batch will skip it - no false alerts during the
 initial learning phase.
 
 ---
 
-## Q5b — Pipeline funnel check
+## Q5b - Pipeline funnel check
 
 For each operator × CDR type, verifies that files flow correctly through
 every processing step today:
@@ -468,11 +473,11 @@ on files still legitimately in progress at batch time (02:00).
 
 ---
 
-## Q_PT — Processing time check
+## Q_PT - Processing time check
 
 **Activates** once ≥ 10 DONE files exist per `cdr_type` in the 7-day window
 (configurable via `min_samples`). Until that threshold is reached it skips
-silently — no false alerts during initial rollout.
+silently - no false alerts during initial rollout.
 
 **Fallback mode** (default, `use_java_timestamps: false`):
 Uses `updated_at - received_at`. This includes queue wait time but is
@@ -489,10 +494,10 @@ Thresholds (configurable in `config.yaml`):
 
 ---
 
-## Q7 — Forfait daily count
+## Q7 - Forfait daily count
 
 Q7 checks that the daily total of forfait records does not collapse
-unexpectedly. It uses two tables already in the Trafscan DB — no new
+unexpectedly. It uses two tables already in the Trafscan DB - no new
 tables are needed:
 
 ```sql
@@ -514,7 +519,7 @@ SELECT
 **Thresholds:** configurable via `batch.forfait.drop_warning_pct` (default 30%)
 and `drop_critical_pct` (default 70%). Zero when 7-day median > 0 → always CRITICAL.
 
-**Part 2 — ES comparison (PENDING):**
+**Part 2 - ES comparison (PENDING):**
 > **TODO for Baha:** Does the ElasticSearch index expose a count of CDR records
 > with `cdrType = 'forfait'` (or an equivalent field) per date?
 > If yes, set `es_enabled: true` in `config.yaml` and fill in `es_index`,
@@ -553,7 +558,7 @@ WantedBy=multi-user.target
 ### Run the nightly batch (02:00 every night)
 
 ```bash
-# Linux — add to crontab
+# Linux - add to crontab
 0 2 * * * cd /opt/trafscan && python batch.py --report /var/trafscan/reports/$(date +\%Y\%m\%d).txt
 ```
 
@@ -575,7 +580,7 @@ python batch.py --report report.txt # full run, save text report
 ```bash
 python alerting.py --config config.yaml --test
 # Generates test_report_v31.html with fake anomaly data
-# Does NOT send email — safe to run anytime to verify the template
+# Does NOT send email - safe to run anytime to verify the template
 ```
 
 ---
@@ -619,14 +624,14 @@ After every batch run, two files are written to `reports/`:
 
 | File | Description |
 |------|-------------|
-| `reports/report_YYYYMMDD_HHMMSS.html` | Full HTML report — open in any browser or NOC panel |
-| `reports/noc_latest.json` | JSON payload — always reflects the most recent batch run |
+| `reports/report_YYYYMMDD_HHMMSS.html` | Full HTML report - open in any browser or NOC panel |
+| `reports/noc_latest.json` | JSON payload - always reflects the most recent batch run |
 
-### Option A — Polling (no server required)
+### Option A - Polling (no server required)
 
 The frontend periodically fetches `noc_latest.json`. Suggested poll interval: 5–15 minutes.
 
-### Option B — Webhook (real-time push)
+### Option B - Webhook (real-time push)
 
 Set `alerting.noc_webhook_url` in `config.yaml`. The batch POSTs the full
 payload to that URL immediately after each run.
@@ -780,7 +785,7 @@ GROUP BY operator_id, cdr_type
 ORDER BY operator_id, cdr_type;
 ```
 
-### Pipeline funnel — received vs completed today
+### Pipeline funnel - received vs completed today
 
 ```sql
 SELECT
@@ -845,7 +850,7 @@ ORDER BY ratio DESC;
 | # | Scenario | Result |
 |---|----------|--------|
 | 1 | Normal Java processing | PENDING → PROCESSING → DONE ✅ |
-| 2 | ES minutes update | delta 0.06% < 0.5% — no alert ✅ |
+| 2 | ES minutes update | delta 0.06% < 0.5% - no alert ✅ |
 | 3 | FTP transfer verification | checksums match, integrity confirmed ✅ |
 | 4 | Missing records (36 missing) | MISMATCH auto-detected ✅ |
 | 5 | Java crash | ERROR + error message written to DB ✅ |
@@ -856,16 +861,18 @@ ORDER BY ratio DESC;
 
 | File | Purpose |
 |------|---------|
-| `trafscan/watcher.py` | File watcher — detects new CDR files, triggers hasher |
+| `trafscan/watcher.py` | File watcher - detects new CDR files, triggers hasher |
 | `trafscan/hasher.py` | SHA-256, line count, DB insert; also contains Java SQL templates |
 | `trafscan/db.py` | PostgreSQL connection pool |
 | `trafscan/__main__.py` | Entry point: `python -m trafscan` |
-| `batch.py` | Nightly reconciliation batch — all checks (Q1–Q7 + Q_PT) |
+| `batch.py` | Nightly reconciliation batch - all checks (Q1–Q7 + Q_PT) |
 | `alerting.py` | HTML report builder, email sender, NOC JSON payload |
-| `simulate_java.py` | Test tool — simulates Java hooks without touching Java code |
+| `simulate_java.py` | Test tool - simulates Java hooks without touching Java code |
 | `verify_ftp.py` | FTP transfer integrity verifier |
 | `config.yaml` | All configuration (DB, watched folders, thresholds, email) |
-| `01_schema.sql` | PostgreSQL schema — run once to initialize |
+| `01_schema.sql` | PostgreSQL schema - run once to initialize |
+| `02_schema_v32.sql` | v3.2 schema migration - prediction tables, Q8/Q9 ENUM values, pre-compressed columns |
+| `seed.py` | Dev utility - seeds prediction_baseline with historical CDR volume data from CDRTextfiles/ for local testing |
 
 ---
 
@@ -907,3 +914,5 @@ checks). See the comments in `01_schema.sql` for the migration path.
 | 2.0 | Apr 2025 | Java hooks refined, FTP verifier |
 | 3.0 | May 2025 | Q3b–Q3e (voice/SMS/data/recharge), Q5a, Q5b |
 | **3.1** | **May 2025** | **Q_PT (processing time), Q7 (forfaits), DB placement clarified, NOC payload v3.1** |
+| **3.2** | **May 2025** | **Couche 5: Q8/Q9 prediction checks, pre-compressed CDR fix (hasher), prediction_baseline and prediction_actuals tables** |
+| **3.2.1** | **May 2025** | **seed.py: seeds prediction_baseline from CDRTextfiles July 2025 history (Option B — aggregated daily/hourly counts, not individual rows in cdr_registry)** |

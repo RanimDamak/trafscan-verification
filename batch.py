@@ -155,12 +155,20 @@ def check_stuck_files(conn, config: dict, dry_run: bool) -> list[dict]:
 
 def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
     """
-    Q2: Files where checksum_transferred differs from the expected checksum
-    (checksum_compressed if available, else checksum_raw).
+    Q2: Files where checksum_transferred differs from the expected checksum.
+ 
+    Expected checksum resolution order:
+      1. checksum_compressed  (always set for pre-compressed files after hasher fix)
+      2. checksum_raw         (fallback: file was never compressed)
+ 
+    Pre-compressed files: checksum_compressed = checksum_raw (set by hasher),
+    so BOTH comparisons produce the same result. No special case needed in SQL,
+    but the result dict now includes is_pre_compressed for report clarity.
+ 
     Always CRITICAL — a corrupted file at the regulator is never acceptable.
     """
     results = []
-
+ 
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -170,7 +178,8 @@ def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
                 cdr_type,
                 checksum_raw,
                 checksum_compressed,
-                checksum_transferred
+                checksum_transferred,
+                COALESCE(is_pre_compressed, FALSE) AS is_pre_compressed
             FROM cdr_registry
             WHERE
                 checksum_transferred IS NOT NULL
@@ -183,9 +192,9 @@ def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
                 )
         """)
         rows = cur.fetchall()
-
+ 
     for row in rows:
-        file_id, file_name, operator_id, cdr_type, raw, compressed, transferred = row
+        file_id, file_name, operator_id, cdr_type, raw, compressed, transferred, pre_comp = row
         expected = compressed if compressed else raw
         results.append({
             "file_id": str(file_id),
@@ -194,11 +203,12 @@ def check_checksum_mismatches(conn, dry_run: bool) -> list[dict]:
             "cdr_type": cdr_type,
             "expected": expected,
             "transferred": transferred,
+            "is_pre_compressed": pre_comp,
             "severity": "CRITICAL",
         })
         log_anomaly(conn, str(file_id), 'CHECKSUM_MISMATCH', 'CRITICAL',
                     dry_run=dry_run)
-
+ 
     return results
 
 
@@ -322,13 +332,15 @@ def check_missing_records(conn, dry_run: bool) -> list[dict]:
     """
     Q4: Files where record_count_processed < record_count_expected.
     Binary CDR types excluded (their expected count is meaningless line count).
-
+    Pre-compressed files included — count_records_smart() gives the correct
+    decompressed record count, so the comparison is valid.
+ 
     Severity:
         WARNING  → missing < 1% of expected
         CRITICAL → missing >= 1% of expected
     """
     results = []
-
+ 
     with conn.cursor() as cur:
         cur.execute("""
             SELECT
@@ -346,14 +358,14 @@ def check_missing_records(conn, dry_run: bool) -> list[dict]:
                 ) AS missing_pct
             FROM cdr_registry
             WHERE
-                processing_status IN ('DONE', 'MISMATCH')
+                processing_status = 'DONE'
                 AND record_count_processed IS NOT NULL
                 AND record_count_processed < record_count_expected
                 AND (notes IS NULL OR notes NOT LIKE '%%Binary CDR%%')
             ORDER BY missing DESC
         """)
         rows = cur.fetchall()
-
+ 
     for row in rows:
         file_id, file_name, operator_id, cdr_type, expected, processed, missing, pct = row
         severity = 'CRITICAL' if float(pct) >= 1.0 else 'WARNING'
@@ -371,7 +383,7 @@ def check_missing_records(conn, dry_run: bool) -> list[dict]:
         log_anomaly(conn, str(file_id), 'MISSING_RECORDS', severity,
                     delta_value=float(pct), threshold_value=1.0,
                     dry_run=dry_run)
-
+ 
     return results
 
 
