@@ -20,4 +20,5 @@ reports/
 
 # OS
 .DS_Store
-Thumbs.db
+Thumbs.dbcdr_test/ 
+CDRTextfiles/ 
