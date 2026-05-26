@@ -10,15 +10,17 @@ build/
 .env
 venv/
 
-# Secrets — never commit these
+# Secrets - never commit these
 config.yaml
 
 # Reports and logs
 reports/
 *.log
-*.txt
+
+# Test data (large, not for repo)
+cdr_test/
+CDRTextfiles/
 
 # OS
 .DS_Store
-Thumbs.dbcdr_test/ 
-CDRTextfiles/ 
+Thumbs.db
